@@ -410,7 +410,6 @@ async fn zdr_sentinel_async_batch_failure_does_not_log_payload(pool: PgPool) {
         template_id,
         Some(file_id),
         "pikachu-async",
-        "",
         &mock_server.uri(),
         "/v1/chat/completions",
         &request_body,

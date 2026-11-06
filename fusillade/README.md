@@ -17,7 +17,7 @@ to execute all of its requests. Then track progress of each request in the
 batch as they're executed by the daemon.
 
 - **Files** group related request templates
-- **Request templates** define HTTP requests (endpoint, method, body, API key)
+- **Request templates** define HTTP requests (endpoint, method, body)
 - **Batches** snapshot all templates in a file and start executing them.
 Multiple batches can be triggered from a single file.
 - **Requests** are created from templates (one per batch) and progress through
@@ -54,7 +54,6 @@ let file_id = store.create_file(
             path: "/v1/chat/completions".to_string(),
             body: r#"{"model":"gpt-4","messages":[{"role":"user","content":"Hello"}]}"#.to_string(),
             model: "gpt-4".to_string(),
-            api_key: env::var("OPENAI_API_KEY")?,
         },
     ],
 ).await?;
@@ -67,7 +66,6 @@ let batch = store.create_batch(BatchInput {
     metadata: None,
     created_by: None,
     api_key_id: None,
-    api_key: None,
     total_requests: None,
 }).await?;
 
@@ -75,6 +73,12 @@ let batch = store.create_batch(BatchInput {
 let status = store.get_batch_status(batch.id).await?;
 println!("Completed: {}/{}", status.completed_requests, status.total_requests);
 ```
+
+No credential is stored with a request, and the default `PostgresDaemon`
+dispatches with none: as written, this example sends unauthenticated requests.
+To authenticate, run the daemon with a `RequestProcessor` that sets each
+dispatch's bearer credential (`RequestData::api_key`), for example from the
+batch's `api_key_id`.
 
 ### Concurrency Control
 
@@ -215,7 +219,6 @@ let batch = store.create_background_batch(BackgroundBatchInput {
     metadata: None,
     created_by: Some("user-id".to_string()),
     api_key_id: None,
-    api_key: None,
     total_requests: None,
 }).await?;
 ```
@@ -227,6 +230,9 @@ use fusillade::CreateBackgroundInput;
 use uuid::Uuid;
 
 let request_id = Uuid::new_v4();
+// The id of an existing API key, e.g. the one that authenticated the caller.
+// Your RequestProcessor turns it into the dispatch credential.
+let api_key_id: Uuid = authenticated_api_key_id;
 store.create_background(CreateBackgroundInput {
     request_id,
     body: r#"{"model":"gpt-4","input":"hello"}"#.to_string(),
@@ -234,8 +240,9 @@ store.create_background(CreateBackgroundInput {
     endpoint: "https://api.example.com".to_string(),
     method: "POST".to_string(),
     path: "/v1/responses".to_string(),
-    api_key: "key".to_string(),
+    api_key_id,
     created_by: "user-id".to_string(),
+    metadata: None,
 }).await?;
 ```
 

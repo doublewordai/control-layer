@@ -30,7 +30,6 @@ async fn upload(manager: &PostgresRequestManager<TestDbPools>) -> FileId {
                 path: "/v1/x".to_string(),
                 body: "{}".to_string(),
                 model: "test-model".to_string(),
-                api_key: "test-key".to_string(),
             }],
         )
         .await
@@ -45,7 +44,6 @@ fn batch_input(file_id: FileId) -> BatchInput {
         metadata: None,
         created_by: None,
         api_key_id: None,
-        api_key: None,
         total_requests: None,
     }
 }

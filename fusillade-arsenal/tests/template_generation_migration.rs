@@ -29,9 +29,9 @@ async fn monday(pool: &PgPool, weeks_from_now: i32) -> chrono::NaiveDate {
 async fn insert_g2_template(pool: &PgPool, week_start: chrono::NaiveDate, file_id: Uuid) -> Uuid {
     let template_id: Uuid = sqlx::query_scalar(
         "INSERT INTO request_templates_g2 (
-             created_on, file_id, endpoint, method, path, body, model, api_key
+             created_on, file_id, endpoint, method, path, body, model
          ) VALUES ($1, $2, 'https://example.invalid', 'POST', '/v1/x',
-                   '{\"gen\":2}', 'test-model', 'test-key')
+                   '{\"gen\":2}', 'test-model')
          RETURNING id",
     )
     .bind(week_start)
@@ -142,8 +142,8 @@ async fn active_view_hides_templates_of_soft_deleted_files_but_keeps_dedicated_o
     // A dedicated batchless template has no file and must stay visible to
     // the claim join.
     let dedicated: Uuid = sqlx::query_scalar(
-        "INSERT INTO request_templates_g2 (created_on, endpoint, method, path, body, model, api_key) \
-         VALUES ($1, 'e', 'POST', '/x', '{\"dedicated\":true}', 'm', 'k') RETURNING id",
+        "INSERT INTO request_templates_g2 (created_on, endpoint, method, path, body, model) \
+         VALUES ($1, 'e', 'POST', '/x', '{\"dedicated\":true}', 'm') RETURNING id",
     )
     .bind(week)
     .fetch_one(&pool)
@@ -271,7 +271,6 @@ async fn file_writes_land_with_routes_and_erase_with_them(pool: PgPool) {
         path: "/v1/x".to_string(),
         body: format!("{{\"cut\":{n}}}"),
         model: "test-model".to_string(),
-        api_key: "test-key".to_string(),
     };
 
     let manager = PostgresRequestManager::new(
@@ -583,8 +582,8 @@ async fn an_unowned_template_row_fails_the_gate_closed(pool: PgPool) {
     // A row with no owning file (file_id NULL) must never be dropped
     // implicitly by scheduled retention.
     sqlx::query(
-        "INSERT INTO request_templates_g2 (created_on, endpoint, method, path, model, api_key) \
-         VALUES ($1, 'e', 'POST', '/x', 'm', 'k')",
+        "INSERT INTO request_templates_g2 (created_on, endpoint, method, path, model) \
+         VALUES ($1, 'e', 'POST', '/x', 'm')",
     )
     .bind(week)
     .execute(&pool)
@@ -619,7 +618,6 @@ async fn a_batch_materializes_requests_from_generation_two_templates(pool: PgPoo
                 path: "/v1/x".to_string(),
                 body: "{\"gen\":2}".to_string(),
                 model: "test-model".to_string(),
-                api_key: "test-key".to_string(),
             }],
         )
         .await
@@ -635,7 +633,6 @@ async fn a_batch_materializes_requests_from_generation_two_templates(pool: PgPoo
             metadata: None,
             created_by: None,
             api_key_id: None,
-            api_key: None,
             total_requests: None,
         })
         .await
@@ -745,7 +742,25 @@ async fn expanded_active_view_reads_both_generations_before_retirement(pool: PgP
     .unwrap();
 
     let g2_file = create_file(&pool).await;
-    let g2_id = insert_g2_template(&pool, week, g2_file).await;
+    // This schema predates the dropped api_key column, which is NOT NULL here.
+    let g2_id: Uuid = sqlx::query_scalar(
+        "INSERT INTO request_templates_g2 (
+             created_on, file_id, endpoint, method, path, body, model, api_key
+         ) VALUES ($1, $2, 'https://example.invalid', 'POST', '/v1/x',
+                   '{\"gen\":2}', 'test-model', '')
+         RETURNING id",
+    )
+    .bind(week)
+    .bind(g2_file)
+    .fetch_one(&pool)
+    .await
+    .expect("generation-2 template must insert");
+    sqlx::query("INSERT INTO request_template_routes (template_id, week_start) VALUES ($1, $2)")
+        .bind(g2_id)
+        .bind(week)
+        .execute(&pool)
+        .await
+        .expect("route must insert");
 
     let bodies: Vec<(Uuid, String)> = sqlx::query_as(
         "SELECT id, body FROM active_request_templates WHERE id = ANY($1) ORDER BY body",

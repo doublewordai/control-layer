@@ -2408,7 +2408,6 @@ mod tests {
                     path: "/test".to_string(),
                     body: "{}".to_string(),
                     model: model.to_string(),
-                    api_key: "key".to_string(),
                 })
                 .collect();
             let file_id = manager.create_file(format!("{name}-file"), None, templates).await.unwrap();
@@ -2420,7 +2419,6 @@ mod tests {
                     metadata: None,
                     created_by: Some(owner.id.to_string()),
                     api_key_id: None,
-                    api_key: None,
                     total_requests: None,
                 })
                 .await

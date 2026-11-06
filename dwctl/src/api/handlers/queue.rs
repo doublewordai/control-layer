@@ -399,7 +399,6 @@ mod tests {
                 path: "/v1/chat/completions".to_string(),
                 body: r#"{"input":"x"}"#.to_string(),
                 model: model.to_string(),
-                api_key: "key".to_string(),
             };
             let file_id = request_manager
                 .create_file(format!("queue-test-{completion_window}"), None, vec![template])
@@ -413,7 +412,6 @@ mod tests {
                     metadata: None,
                     created_by: None,
                     api_key_id: None,
-                    api_key: None,
                     total_requests: None,
                 })
                 .await
@@ -431,7 +429,6 @@ mod tests {
                 endpoint: "http://localhost".to_string(),
                 method: "POST".to_string(),
                 path: "/v1/responses".to_string(),
-                api_key: String::new(),
                 created_by: "queue-user".to_string(),
             })
             .await
@@ -498,7 +495,6 @@ mod tests {
                 path: "/v1/chat/completions".to_string(),
                 body: r#"{"input":"x"}"#.to_string(),
                 model: model.to_string(),
-                api_key: "key".to_string(),
             };
             let file_id = request_manager
                 .create_file(format!("queue-query-test-{completion_window}"), None, vec![template])
@@ -512,7 +508,6 @@ mod tests {
                     metadata: None,
                     created_by: None,
                     api_key_id: None,
-                    api_key: None,
                     total_requests: None,
                 })
                 .await
@@ -528,7 +523,6 @@ mod tests {
                 endpoint: "http://localhost".to_string(),
                 method: "POST".to_string(),
                 path: "/v1/responses".to_string(),
-                api_key: String::new(),
                 created_by: "queue-user".to_string(),
             })
             .await
@@ -772,7 +766,6 @@ mod tests {
             path: "/v1/chat/completions".to_string(),
             body: r#"{"input":"x"}"#.to_string(),
             model: model.to_string(),
-            api_key: "key".to_string(),
         };
         let file_id = request_manager
             .create_file("trailing-test".to_string(), None, vec![template])
@@ -789,7 +782,6 @@ mod tests {
                 metadata: None,
                 created_by: None,
                 api_key_id: None,
-                api_key: None,
                 total_requests: None,
             })
             .await
@@ -813,7 +805,6 @@ mod tests {
             endpoint: "http://localhost".to_string(),
             method: "POST".to_string(),
             path: "/v1/responses".to_string(),
-            api_key: String::new(),
             created_by: "queue-user".to_string(),
             started_at: now - chrono::Duration::seconds(90),
             completed_at: now - chrono::Duration::seconds(60),

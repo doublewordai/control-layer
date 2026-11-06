@@ -209,7 +209,6 @@ pub async fn complete_response_idempotent<P: PoolProvider + Clone>(
         endpoint: create_ctx.base_url.to_string(),
         method: "POST".to_string(),
         path: create_ctx.endpoint.to_string(),
-        api_key: create_ctx.api_key.unwrap_or("").to_string(),
         created_by: created_by.unwrap_or_default(),
     };
     let create_failed = match request_manager.create_realtime(realtime_input).await {

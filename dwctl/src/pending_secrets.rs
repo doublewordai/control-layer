@@ -42,10 +42,10 @@ fn unwrap_current(keystore: &Keystore, wrapped: &[u8], secret_hash: &[u8]) -> Op
 /// The secret a consumed reveal hands to the holder: the wrapped pending
 /// secret, when it unwraps to the key's current secret. `None` otherwise.
 pub fn resolve_reveal(keystore: Option<&Keystore>, reveal: &PendingReveal) -> Option<String> {
-    let (Some(keystore), Some(wrapped), Some(hash)) = (keystore, reveal.pending_secret.as_deref(), reveal.secret_hash.as_deref()) else {
+    let (Some(keystore), Some(wrapped)) = (keystore, reveal.pending_secret.as_deref()) else {
         return None;
     };
-    unwrap_current(keystore, wrapped, hash)
+    unwrap_current(keystore, wrapped, &reveal.secret_hash)
 }
 
 /// Outcome of one reconcile pass.
@@ -72,10 +72,10 @@ enum PendingState {
 }
 
 fn pending_state(keystore: Option<&Keystore>, row: &PendingReveal) -> PendingState {
-    let (Some(keystore), Some(secret_hash), Some(wrapped)) = (keystore, row.secret_hash.as_deref(), row.pending_secret.as_deref()) else {
+    let (Some(keystore), Some(wrapped)) = (keystore, row.pending_secret.as_deref()) else {
         return PendingState::Unrecoverable;
     };
-    match unwrap_current(keystore, wrapped, secret_hash) {
+    match unwrap_current(keystore, wrapped, &row.secret_hash) {
         Some(_) if keystore.is_current(wrapped) => PendingState::Verified,
         Some(secret) => PendingState::Rewrap { secret },
         None => PendingState::Unrecoverable,
@@ -96,9 +96,8 @@ async fn rewrap_rows(
         let PendingState::Rewrap { secret } = pending_state(Some(keystore), &row) else {
             continue;
         };
-        let Some(secret_hash) = row.secret_hash.as_deref() else { continue };
         let wrapped = keystore.wrap(secret.as_bytes())?;
-        if repo.set_pending_secret(row.id, &wrapped, secret_hash).await? {
+        if repo.set_pending_secret(row.id, &wrapped, &row.secret_hash).await? {
             report.rewrapped += 1;
         }
     }
@@ -192,7 +191,7 @@ mod tests {
         PendingReveal {
             id: uuid::Uuid::new_v4(),
             pending_secret,
-            secret_hash: Some(hash_api_key(secret).to_vec()),
+            secret_hash: hash_api_key(secret).to_vec(),
         }
     }
 

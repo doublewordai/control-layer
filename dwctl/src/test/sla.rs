@@ -212,7 +212,6 @@ async fn test_route_at_claim_time_escalation(pool: PgPool) {
             template_id,
             Some(file_id),
             "test-model",
-            "",
             &mock_server.uri(),
             "/v1/chat/completions",
             &serde_json::to_string(
@@ -476,7 +475,6 @@ async fn test_no_escalation_when_not_near_expiry(pool: PgPool) {
             template_id,
             Some(file_id),
             "test-model",
-            "",
             &mock_server.uri(),
             "/v1/chat/completions",
             &serde_json::to_string(

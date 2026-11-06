@@ -115,7 +115,6 @@ pub async fn insert_fusillade_template(
     template_id: Uuid,
     file_id: Option<Uuid>,
     model: &str,
-    api_key: &str,
     endpoint: &str,
     path: &str,
     body: &str,
@@ -132,8 +131,8 @@ pub async fn insert_fusillade_template(
     sqlx::query(
         "WITH inserted AS ( \
              INSERT INTO fusillade.request_templates_g2 \
-                 (created_on, id, file_id, custom_id, endpoint, method, path, body, model, api_key, body_byte_size) \
-             VALUES ((transaction_timestamp() AT TIME ZONE 'UTC')::date, $1, $2, $3, $4, 'POST', $5, $6, $7, $8, octet_length($6)) \
+                 (created_on, id, file_id, custom_id, endpoint, method, path, body, model, body_byte_size) \
+             VALUES ((transaction_timestamp() AT TIME ZONE 'UTC')::date, $1, $2, $3, $4, 'POST', $5, $6, $7, octet_length($6)) \
              RETURNING id, created_on \
          ) \
          INSERT INTO fusillade.request_template_routes (template_id, week_start) \
@@ -146,7 +145,6 @@ pub async fn insert_fusillade_template(
     .bind(path)
     .bind(body)
     .bind(model)
-    .bind(api_key)
     .execute(&mut *tx)
     .await
     .expect("insert request template");

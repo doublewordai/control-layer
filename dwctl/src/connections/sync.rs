@@ -632,7 +632,6 @@ pub(crate) async fn run_ingest_file<P: PoolProvider + Clone + Send + Sync + 'sta
                             path: url,
                             body,
                             model,
-                            api_key: String::new(), // Dispatched as the batch's api_key_id
                         };
 
                         if tx.send(FileStreamItem::Template(template)).await.is_err() {
@@ -736,7 +735,6 @@ pub(crate) async fn run_ingest_file<P: PoolProvider + Clone + Send + Sync + 'sta
                         path: url,
                         body,
                         model,
-                        api_key: String::new(),
                     };
                     if tx.send(FileStreamItem::Template(template)).await.is_err() {
                         return (template_count, skipped_lines, validation_errors);
@@ -1151,7 +1149,6 @@ pub(crate) async fn run_activate_batch<P: PoolProvider + Clone + Send + Sync + '
             metadata: Some(metadata),
             created_by: Some(batch_owner.to_string()),
             api_key_id: Some(api_key_id),
-            api_key: None,
             total_requests: Some(input.template_count as i64),
         };
 
@@ -1465,7 +1462,6 @@ mod tests {
             path: "/v1/chat/completions".to_string(),
             body: serde_json::json!({"model": model, "messages": [{"role": "user", "content": "hi"}]}).to_string(),
             model: model.to_string(),
-            api_key: String::new(),
         }
     }
 
@@ -1477,7 +1473,6 @@ mod tests {
             path: "/v1/chat/completions".to_string(),
             body: "{}".to_string(),
             model: String::new(), // empty — tier 2 error
-            api_key: String::new(),
         }
     }
 

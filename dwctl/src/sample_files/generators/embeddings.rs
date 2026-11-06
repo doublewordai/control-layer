@@ -131,7 +131,6 @@ impl SampleGenerator for EmbeddingsGenerator {
                     method: "POST".to_string(),
                     path: "/v1/embeddings".to_string(),
                     model: model_alias.to_string(),
-                    api_key: String::new(),
                     body: body.to_string(),
                 }
             })
@@ -163,7 +162,6 @@ mod tests {
             assert_eq!(req.method, "POST");
             assert_eq!(req.path, "/v1/embeddings");
             assert_eq!(req.model, "text-embedding-ada-002");
-            assert!(req.api_key.is_empty());
 
             // Verify body is valid JSON with expected structure
             let body: serde_json::Value = serde_json::from_str(&req.body).unwrap();

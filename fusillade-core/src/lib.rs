@@ -3,7 +3,7 @@
 //! This crate contains the stable type universe shared by storage
 //! implementations and the scheduling daemon.
 
-/// Implements `Debug` for a struct that holds an `api_key` secret, printing
+/// Implements `Debug` for a struct that holds an `api_key` credential, printing
 /// every other field normally and the key as `<redacted>`.
 ///
 /// Debug output reaches logs through `#[tracing::instrument]` arguments and
@@ -47,7 +47,6 @@ pub use request::*;
 mod redacted_api_key_tests {
     use std::collections::HashMap;
 
-    use chrono::Utc;
     use uuid::Uuid;
 
     use super::*;
@@ -61,54 +60,7 @@ mod redacted_api_key_tests {
     }
 
     #[test]
-    fn batch_types_redact_the_api_key() {
-        let now = Utc::now();
-        assert_redacted(&RequestTemplate {
-            id: TemplateId::from(Uuid::new_v4()),
-            file_id: FileId::from(Uuid::new_v4()),
-            custom_id: None,
-            endpoint: "http://localhost".to_string(),
-            method: "POST".to_string(),
-            path: "/v1/chat/completions".to_string(),
-            body: "{}".to_string(),
-            model: "model-a".to_string(),
-            api_key: SECRET.to_string(),
-            created_at: now,
-            updated_at: now,
-        });
-        assert_redacted(&RequestTemplateInput {
-            custom_id: None,
-            endpoint: "http://localhost".to_string(),
-            method: "POST".to_string(),
-            path: "/v1/chat/completions".to_string(),
-            body: "{}".to_string(),
-            model: "model-a".to_string(),
-            api_key: SECRET.to_string(),
-        });
-        assert_redacted(&BatchInput {
-            file_id: FileId::from(Uuid::new_v4()),
-            endpoint: "/v1/chat/completions".to_string(),
-            completion_window: "24h".to_string(),
-            metadata: None,
-            created_by: None,
-            api_key_id: None,
-            api_key: Some(SECRET.to_string()),
-            total_requests: None,
-        });
-        assert_redacted(&BackgroundBatchInput {
-            file_id: FileId::from(Uuid::new_v4()),
-            endpoint: "/v1/chat/completions".to_string(),
-            metadata: None,
-            created_by: None,
-            api_key_id: None,
-            api_key: Some(SECRET.to_string()),
-            total_requests: None,
-        });
-    }
-
-    #[test]
-    fn request_types_redact_the_api_key() {
-        let now = Utc::now();
+    fn request_data_redacts_the_api_key() {
         assert_redacted(&RequestData {
             id: RequestId::from(Uuid::new_v4()),
             batch_id: None,
@@ -122,52 +74,6 @@ mod redacted_api_key_tests {
             api_key: SECRET.to_string(),
             created_by: "user".to_string(),
             batch_metadata: HashMap::new(),
-        });
-        assert_redacted(&CreateRealtimeInput {
-            request_id: Uuid::new_v4(),
-            body: "{}".to_string(),
-            model: "model-a".to_string(),
-            endpoint: "http://localhost".to_string(),
-            method: "POST".to_string(),
-            path: "/v1/responses".to_string(),
-            api_key: SECRET.to_string(),
-            created_by: "user".to_string(),
-        });
-        assert_redacted(&PersistCompletedRealtimeInput {
-            request_id: Uuid::new_v4(),
-            response_body: "{}".to_string(),
-            status_code: 200,
-            request_body: "{}".to_string(),
-            model: "model-a".to_string(),
-            endpoint: "http://localhost".to_string(),
-            method: "POST".to_string(),
-            path: "/v1/responses".to_string(),
-            api_key: SECRET.to_string(),
-            created_by: "user".to_string(),
-            started_at: now,
-            completed_at: now,
-        });
-        assert_redacted(&CreateFlexInput {
-            request_id: Uuid::new_v4(),
-            body: "{}".to_string(),
-            model: "model-a".to_string(),
-            endpoint: "http://localhost".to_string(),
-            method: "POST".to_string(),
-            path: "/v1/responses".to_string(),
-            api_key: SECRET.to_string(),
-            created_by: "user".to_string(),
-            metadata: None,
-        });
-        assert_redacted(&CreateBackgroundInput {
-            request_id: Uuid::new_v4(),
-            body: "{}".to_string(),
-            model: "model-a".to_string(),
-            endpoint: "http://localhost".to_string(),
-            method: "POST".to_string(),
-            path: "/v1/responses".to_string(),
-            api_key: SECRET.to_string(),
-            created_by: "user".to_string(),
-            metadata: None,
         });
     }
 }

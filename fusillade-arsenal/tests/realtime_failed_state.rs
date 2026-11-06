@@ -34,7 +34,6 @@ fn processing_input(request_id: Uuid) -> CreateRealtimeInput {
         endpoint: "http://localhost".to_string(),
         method: "POST".to_string(),
         path: "/v1/chat/completions".to_string(),
-        api_key: "test-key".to_string(),
         created_by: "test-user".to_string(),
     }
 }
@@ -53,7 +52,6 @@ fn realtime_input(
         endpoint: "http://localhost".to_string(),
         method: "POST".to_string(),
         path: "/v1/chat/completions".to_string(),
-        api_key: "test-key".to_string(),
         created_by: "test-user".to_string(),
         started_at: Utc::now(),
         completed_at: Utc::now(),

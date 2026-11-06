@@ -256,8 +256,6 @@ impl OpenAIBatchRequest {
             path: self.url.clone(),
             body,
             model,
-            // Dispatched as the batch's api_key_id; no key is stored.
-            api_key: String::new(),
         })
     }
 
