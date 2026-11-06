@@ -109,6 +109,7 @@ async fn unknown_models_are_counted_without_the_model_name() {
     assert_eq!(
         count(&[
             ("model", ""),
+            ("serving_class", "standard"),
             ("status", "404"),
             ("code", "model_not_found")
         ]),
@@ -214,4 +215,56 @@ async fn upstream_client_errors_are_not_counted() {
     assert_eq!(response.json::<Value>()["error"]["code"], "upstream_error");
     assert_eq!(mock.get_requests().len(), 1);
     assert_eq!(count(&[("model", alias)]), None);
+}
+
+#[tokio::test]
+async fn class_route_rejections_are_counted_as_their_model_and_class() {
+    LazyLock::force(&METRICS);
+    let model = "class-rejection-model";
+    let route = format!("{model}:fast");
+    let targets = Targets::from_config(
+        serde_json::from_value(json!({
+            "strict_mode": true,
+            "targets": {
+                model: {"providers": [{"url": "https://upstream.example.com/v1/"}]},
+                route.as_str(): {"providers": [{"url": "https://upstream.example.com/v1/"}], "class_route_of": model}
+            }
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    let mock = MockHttpClient::new(StatusCode::OK, COMPLETION);
+    let server = TestServer::new(build_strict_router(AppState::with_client(
+        targets,
+        mock.clone(),
+    )))
+    .unwrap();
+
+    for name in [model, route.as_str()] {
+        let body = request(name, json!({"chat_template_kwargs": {"custom_flag": 1}}));
+        server
+            .post("/chat/completions")
+            .json(&body)
+            .await
+            .assert_status(StatusCode::BAD_REQUEST);
+    }
+
+    assert!(mock.get_requests().is_empty());
+    assert!(!METRICS.render().contains(&format!("model=\"{route}\"")));
+    assert_eq!(
+        count(&[
+            ("model", model),
+            ("serving_class", "fast"),
+            ("status", "400")
+        ]),
+        Some(1.0)
+    );
+    assert_eq!(
+        count(&[
+            ("model", model),
+            ("serving_class", "standard"),
+            ("status", "400")
+        ]),
+        Some(1.0)
+    );
 }

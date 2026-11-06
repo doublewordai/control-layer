@@ -174,9 +174,10 @@ pub struct AppState<T: HttpClient> {
     /// Parameters from [`unsupported_params::params`] that get a 400 instead of
     /// being forwarded. Every other flagged parameter is only counted and traced.
     pub rejected_params: Vec<&'static str>,
-    /// Per-model exceptions to `rejected_params`, keyed by the requested model
-    /// name: these parameters are forwarded for that model although the reject
-    /// list names them. They are still counted and traced.
+    /// Per-model exceptions to `rejected_params`, keyed by model name: these
+    /// parameters are forwarded for that model although the reject list names
+    /// them. A serving-class route (`model:<class>`) takes its model's
+    /// exceptions. They are still counted and traced.
     pub model_allowed_params: std::collections::HashMap<String, Vec<&'static str>>,
     pub inflight_limiter: Arc<dyn inflight::InflightLimiter>,
     /// Enforces the per-model batch in-flight cap. Off, dispatched batch

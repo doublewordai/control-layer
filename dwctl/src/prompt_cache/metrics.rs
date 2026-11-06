@@ -4,9 +4,11 @@
 //! Conventions:
 //! - Every metric name is `dwctl_cache_*`.
 //! - Low-cardinality labels are `&'static str` literals (`outcome`/`reason`/`tier`/`result`/`marked`).
-//!   The dynamic label is `model` (owned `String`), attached in exactly TWO places, each with its
-//!   own bounding guarantee: `record_token_volumes` (emitted solely for cache-ENABLED models — the
-//!   alias has a tariff) and `record_tokenizer_duration` (the caller labels by model only for a name
+//!   The dynamic labels are `model` and `serving_class` (owned `String`s). `model` is attached in
+//!   exactly TWO places, each with its own bounding guarantee: `record_token_volumes` (emitted
+//!   solely for cache-ENABLED models — the alias has a tariff — together with `serving_class`,
+//!   bounded the same way: only a configured class route of such a model reaches it) and
+//!   `record_tokenizer_duration` (the caller labels by model only for a name
 //!   tokenizer-svc ACCEPTED — its baked map is the bound; every error path is clamped to a fixed
 //!   value, see `TokenizerClient::tokenize`). The all-traffic metrics (`marker_requests`,
 //!   `requests`) carry **no `model` label**, because the raw request `model` is unvalidated there
@@ -18,6 +20,8 @@
 //!   recorder builder.
 
 use metrics::{counter, histogram};
+
+use crate::inference::serving_name::{STANDARD_CLASS, split_served};
 
 // ── Adoption ──────────────────────────────────────────────────────────────────
 
@@ -52,13 +56,24 @@ pub fn record_request_outcome(outcome: &'static str) {
 /// `read / (read + creation)`. The full-prompt hit rate and the uncached residual are
 /// [DB]-derived from `http_analytics` (`prompt_tokens − read − creation`), which is also
 /// the authoritative billing source — this counter is the real-time *classified* volume.
-pub fn record_token_volumes(model: &str, read: u64, creation_5m: u64, creation_1h: u64, creation_24h: u64) {
+/// `requested` is the name as requested (`model` or a class route `model:<class>`); it is
+/// labelled as `model` and `serving_class`, both bounded by the cache-enabled models and
+/// their configured classes.
+pub fn record_token_volumes(requested: &str, read: u64, creation_5m: u64, creation_1h: u64, creation_24h: u64) {
+    let (model, class) = split_served(requested);
+    let class = class.unwrap_or(STANDARD_CLASS).to_owned();
     if read > 0 {
-        counter!("dwctl_cache_read_input_tokens_total", "model" => model.to_owned()).increment(read);
+        counter!("dwctl_cache_read_input_tokens_total", "model" => model.to_owned(), "serving_class" => class.clone()).increment(read);
     }
     for (tier, n) in [("5m", creation_5m), ("1h", creation_1h), ("24h", creation_24h)] {
         if n > 0 {
-            counter!("dwctl_cache_creation_input_tokens_total", "model" => model.to_owned(), "tier" => tier).increment(n);
+            counter!(
+                "dwctl_cache_creation_input_tokens_total",
+                "model" => model.to_owned(),
+                "serving_class" => class.clone(),
+                "tier" => tier
+            )
+            .increment(n);
         }
     }
 }

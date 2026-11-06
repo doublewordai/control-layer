@@ -241,7 +241,10 @@ async fn sigterm_preserves_sse_and_metrics_until_the_body_finishes() {
         .text()
         .await
         .unwrap();
-    assert!(metrics.contains("onwards_model_inflight{model=\"test-model\"} 1"));
+    assert!(
+        metrics
+            .contains("onwards_model_inflight{model=\"test-model\",serving_class=\"standard\"} 1")
+    );
     assert!(gateway.child.try_wait().unwrap().is_none());
     gateway.engine.finish.add_permits(1);
     let mut tail = Vec::new();

@@ -157,10 +157,15 @@ fn cache_class_deals_require_a_general_enablement_row_and_respect_history() {
             .read,
         Decimal::ZERO
     );
+    // The account's model-level multipliers cover every class without its own.
     assert_eq!(
         resolve_cache_multipliers(&rows, now, Some(account), Some("throughput"))
             .unwrap()
             .read,
+        Decimal::new(5, 1)
+    );
+    assert_eq!(
+        resolve_cache_multipliers(&rows, now, Some(account), Some("standard")).unwrap().read,
         Decimal::new(5, 1)
     );
     assert_eq!(
@@ -451,6 +456,8 @@ async fn playground_exhausts_each_customer_scope_before_general_prices(pool: PgP
                         mask & (1 << index) != 0
                             && (scope.is_none() || *scope == owner)
                             && (c.is_none() || *c == class)
+                            // An account's class-less deal covers the standard class only.
+                            && !(scope.is_some() && c.is_none() && class.is_some_and(|k| k != "standard"))
                             && (purpose == ApiKeyPurpose::Playground || *p == ApiKeyPurpose::Realtime)
                     })
                     .map(|(_, (_, _, _, price))| (Decimal::from(*price), Decimal::from(*price)));
@@ -796,6 +803,9 @@ async fn public_class_prices_follow_account_deals_and_preserve_exact_batch_windo
             .await
             .unwrap();
     let model:Uuid=sqlx::query_scalar("INSERT INTO deployed_models (model_name,alias,is_composite,created_by,routing_mode) VALUES ('public-class-test','public-class-test',true,$1,'class_routes') RETURNING id").bind(account).fetch_one(&pool).await.unwrap();
+    // An active activation has a standard class.
+    sqlx::query("WITH ep AS (INSERT INTO inference_endpoints (name,url,created_by) VALUES ('public-class-ep','http://localhost:8080',$2) RETURNING id) INSERT INTO model_serving_classes (deployed_model_id,class_key,display_name,inference_endpoint_id,upstream_model_name) SELECT $1,'standard','Standard',id,'upstream' FROM ep")
+        .bind(model).bind(account).execute(&pool).await.unwrap();
     let now = Utc::now();
     let mut rows = Vec::new();
     for (owner, class, purpose, window, price) in [
@@ -872,9 +882,15 @@ fn public_class_cache_multipliers_inherit_enablement_and_follow_account_deals() 
         resolve_cache_multipliers(&rows, now, None, Some("fast")).unwrap().read,
         Decimal::from(2)
     );
+    // The account's model-level multipliers beat the public fast ones...
     rows.push(row(Some(account), None, 1));
     assert_eq!(
         resolve_cache_multipliers(&rows, now, Some(account), Some("fast")).unwrap().read,
+        Decimal::from(1)
+    );
+    // ...and cover standard; an account class deal beats them both.
+    assert_eq!(
+        resolve_cache_multipliers(&rows, now, Some(account), Some("standard")).unwrap().read,
         Decimal::ONE
     );
     rows.push(row(Some(account), Some("fast"), 0));

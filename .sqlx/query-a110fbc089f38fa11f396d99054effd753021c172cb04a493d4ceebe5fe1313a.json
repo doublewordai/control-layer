@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "\n        SELECT p.user_id, dm.alias, p.serving_class, p.priority, p.ttft_ms, p.itl_ms\n        FROM account_model_policies p\n        INNER JOIN deployed_models dm ON dm.id = p.deployed_model_id\n        INNER JOIN users u ON u.id = p.user_id\n        WHERE dm.deleted = FALSE\n          AND u.is_deleted = FALSE\n          AND (p.serving_class IS NULL OR p.serving_class = 'standard')\n        ORDER BY p.serving_class NULLS FIRST\n        ",
+  "query": "\n        SELECT p.user_id, dm.alias, p.serving_class, p.priority, p.ttft_ms, p.itl_ms\n        FROM account_model_policies p\n        INNER JOIN deployed_models dm ON dm.id = p.deployed_model_id\n        INNER JOIN users u ON u.id = p.user_id\n        WHERE dm.deleted = FALSE\n          AND u.is_deleted = FALSE\n        ORDER BY p.serving_class NULLS FIRST\n        ",
   "describe": {
     "columns": [
       {
@@ -46,5 +46,5 @@
       true
     ]
   },
-  "hash": "95bac76d1001d7010e8921cf4d531dc0de7b833f86ee0d35929c784990c7c0eb"
+  "hash": "a110fbc089f38fa11f396d99054effd753021c172cb04a493d4ceebe5fe1313a"
 }

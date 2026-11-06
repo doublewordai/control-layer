@@ -264,15 +264,23 @@ impl ReconstructedSplit {
 /// fields the serving path deliberately ignored and manufacture a billing disagreement.
 pub async fn reconstruct_split(
     classifier: &crate::prompt_cache::Classifier,
-    virtual_model: &str,
+    model: &str,
+    class: Option<&str>,
     request_body: &[u8],
     principal: crate::types::UserId,
     at: DateTime<Utc>,
     route_has_blocks: bool,
 ) -> CacheResult<Option<ReconstructedSplit>> {
+    // Serving scoped a class route's entries by `model:<class>`; the standard
+    // class (and every legacy model) by the model alone.
+    let virtual_model = match class {
+        Some(class) if class != crate::inference::serving_name::STANDARD_CLASS => format!("{model}:{class}"),
+        _ => model.to_owned(),
+    };
     let outcome = classifier
         .classify(crate::prompt_cache::ClassifyRequest {
-            virtual_model,
+            virtual_model: &virtual_model,
+            model,
             body: request_body,
             api_key: None,
             principal: Some(principal),

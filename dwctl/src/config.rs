@@ -1465,10 +1465,11 @@ pub struct OnwardsConfig {
     /// here are refused. Names must come from `onwards::unsupported_params::params()`.
     /// Default: empty (observe only).
     pub rejected_params: Vec<String>,
-    /// Per-model exceptions to `rejected_params`, keyed by the model name the
-    /// client requests: the listed parameters are forwarded for that model
-    /// although `rejected_params` names them. For a model whose every worker
-    /// honours a parameter the rest of the fleet can't. Names must come from
+    /// Per-model exceptions to `rejected_params`, keyed by model alias: the
+    /// listed parameters are forwarded for that model, and every serving class
+    /// of it (`model:<class>`), although `rejected_params` names them. For a
+    /// model whose every worker honours a parameter the rest of the fleet
+    /// can't. Keys never contain ':'. Names must come from
     /// `onwards::unsupported_params::params()`. Default: empty.
     pub model_allowed_params: std::collections::BTreeMap<String, Vec<String>>,
 }
@@ -3843,6 +3844,20 @@ impl Config {
                 operation: format!("Config validation: onwards.rejected_params names an unknown parameter: {name}"),
             });
         }
+        // A class route takes its model's exceptions, so a key naming a class
+        // would never match.
+        if let Some(model) = self
+            .onwards
+            .model_allowed_params
+            .keys()
+            .find(|model| model.contains(crate::inference::serving_name::CLASS_SEPARATOR))
+        {
+            return Err(Error::Internal {
+                operation: format!(
+                    "Config validation: onwards.model_allowed_params.{model} names a serving class; key the exceptions by the model alias, which covers its classes"
+                ),
+            });
+        }
         if let Some((model, name)) = self.onwards.model_allowed_params.iter().find_map(|(model, params)| {
             params
                 .iter()
@@ -4570,6 +4585,21 @@ mod tests {
             .insert("example/model".to_string(), vec!["logprob".to_string()]);
         let error = config.validate().unwrap_err().to_string();
         assert!(error.contains("onwards.model_allowed_params.example/model names an unknown parameter: logprob"));
+    }
+
+    #[test]
+    fn model_allowed_params_are_keyed_by_model_not_class() {
+        let mut config = Config::default();
+        config.secret_key = Some("test-secret-key".to_string());
+        config
+            .onwards
+            .model_allowed_params
+            .insert("example/model:fast".to_string(), vec!["logprobs".to_string()]);
+        let error = config.validate().unwrap_err().to_string();
+        assert!(
+            error.contains("onwards.model_allowed_params.example/model:fast names a serving class"),
+            "{error}"
+        );
     }
 
     #[test]

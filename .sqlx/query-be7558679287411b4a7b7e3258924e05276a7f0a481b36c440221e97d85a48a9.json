@@ -1,0 +1,32 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n            SELECT DISTINCT ON (cm.alias)\n                cm.alias,\n                first_value(dmc.render_kwargs) OVER (\n                    PARTITION BY dmc.composite_model_id\n                    ORDER BY (dmc.render_kwargs IS NULL), dmc.sort_order ASC\n                ) AS render_kwargs,\n                dmc.strip_leading_bos\n            FROM deployed_model_components dmc\n            JOIN deployed_models cm ON cm.id = dmc.composite_model_id\n            JOIN deployed_models dm ON dm.id = dmc.deployed_model_id\n            WHERE dmc.pool = 'completions'\n              AND dmc.enabled = true\n              AND cm.deleted = false\n              -- A class-routed model's targets have no completions pool.\n              AND NOT class_routes_active(cm.id)\n              AND dm.deleted = false\n            ORDER BY\n                cm.alias,\n                EXISTS (\n                    SELECT 1 FROM deployed_model_components shared\n                    WHERE shared.composite_model_id = dmc.composite_model_id\n                      AND shared.deployed_model_id = dmc.deployed_model_id\n                      AND shared.pool = 'default'\n                ),\n                dmc.sort_order ASC\n            ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "alias",
+        "type_info": "Varchar"
+      },
+      {
+        "ordinal": 1,
+        "name": "render_kwargs",
+        "type_info": "Jsonb"
+      },
+      {
+        "ordinal": 2,
+        "name": "strip_leading_bos",
+        "type_info": "Bool"
+      }
+    ],
+    "parameters": {
+      "Left": []
+    },
+    "nullable": [
+      false,
+      null,
+      false
+    ]
+  },
+  "hash": "be7558679287411b4a7b7e3258924e05276a7f0a481b36c440221e97d85a48a9"
+}
