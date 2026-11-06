@@ -23,6 +23,10 @@ struct Fixture {
 
 impl Fixture {
     async fn new(pool: &PgPool) -> Self {
+        Self::with_config(pool, |_| {}).await
+    }
+
+    async fn with_config(pool: &PgPool, configure: impl FnOnce(&mut crate::config::Config)) -> Self {
         let upstream = MockServer::start().await;
         Mock::given(method("POST"))
             .respond_with(|request: &Request| {
@@ -50,6 +54,7 @@ impl Fixture {
         let mut config = create_test_config();
         config.onwards.strict_mode = true;
         config.background_services.onwards_sync.enabled = true;
+        configure(&mut config);
         let app = Application::new_with_pool(config, Some(pool.clone()), None).await.unwrap();
         let (server, services) = app.into_test_server();
         let user = create_test_user_with_roles(pool, vec![Role::StandardUser, Role::BatchAPIUser]).await;
@@ -415,7 +420,7 @@ async fn class_routes_serve_realtime_by_class_and_bill_the_class(pool: PgPool) {
     let f = Fixture::new(&pool).await;
     activate_policy_classes(&f, &pool).await;
 
-    // Discovery lists the class beside the model.
+    // Discovery doesn't list the class by default; it is still served below.
     let models: Value = f
         .server
         .get("/ai/v1/models")
@@ -423,8 +428,7 @@ async fn class_routes_serve_realtime_by_class_and_bill_the_class(pool: PgPool) {
         .await
         .json();
     let ids: Vec<&str> = models["data"].as_array().unwrap().iter().filter_map(|m| m["id"].as_str()).collect();
-    assert!(ids.contains(&"policy") && ids.contains(&"policy:fast"), "{ids:?}");
-    assert!(!ids.contains(&"policy:standard"));
+    assert!(ids.contains(&"policy") && !ids.contains(&"policy:fast"), "{ids:?}");
 
     // Realtime: the alias reaches standard's upstream, alias:fast reaches fast's,
     // each carrying its own class's prices to the engine.
@@ -521,12 +525,61 @@ async fn class_routes_serve_realtime_by_class_and_bill_the_class(pool: PgPool) {
     .expect("two usage debits");
     assert!(descriptions[0].starts_with("API usage: policy ("), "{descriptions:?}");
     assert!(descriptions[1].starts_with("API usage: policy:fast ("), "{descriptions:?}");
+
+    // Usage lists each class the customer used as its own entry, and the
+    // realtime comparison prices each entry as it bills.
+    crate::db::handlers::analytics::refresh_user_model_usage_daily(&pool).await.unwrap();
+    let mut usage: Vec<(String, i64, Decimal)> = crate::db::handlers::analytics::get_user_model_breakdown(&pool, f.user)
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|entry| (entry.model, entry.request_count, entry.cost.parse().unwrap()))
+        .collect();
+    usage.sort();
+    assert_eq!(
+        usage,
+        vec![
+            ("policy".to_owned(), 1, Decimal::new(30, 6)),
+            ("policy:fast".to_owned(), 1, Decimal::new(60, 6))
+        ]
+    );
+    let prices = crate::db::handlers::analytics::get_realtime_tariffs(&pool, f.user, &["policy".to_owned(), "policy:fast".to_owned()])
+        .await
+        .unwrap();
+    assert_eq!(prices["policy"], (Decimal::new(2, 6), Decimal::new(2, 6)));
+    assert_eq!(prices["policy:fast"], (Decimal::new(4, 6), Decimal::new(4, 6)));
+    // The model's users table counts its classes towards the model.
+    let by_user = crate::db::handlers::analytics::get_model_user_usage(
+        &pool,
+        "policy",
+        chrono::Utc::now() - chrono::Duration::days(1),
+        chrono::Utc::now() + chrono::Duration::days(1),
+    )
+    .await
+    .unwrap();
+    assert_eq!(by_user.users.iter().map(|u| u.request_count).sum::<i64>(), 2);
+    f.services.shutdown().await;
+}
+
+#[dwctl_test_macros::test]
+async fn discovery_lists_class_routes_when_enabled(pool: PgPool) {
+    let f = Fixture::with_config(&pool, |config| config.discovery.list_class_routes = true).await;
+    activate_policy_classes(&f, &pool).await;
+    let models: Value = f
+        .server
+        .get("/ai/v1/models")
+        .add_header("Authorization", format!("Bearer {}", f.key))
+        .await
+        .json();
+    let ids: Vec<&str> = models["data"].as_array().unwrap().iter().filter_map(|m| m["id"].as_str()).collect();
+    assert!(ids.contains(&"policy") && ids.contains(&"policy:fast"), "{ids:?}");
+    assert!(!ids.contains(&"policy:standard"));
     f.services.shutdown().await;
 }
 
 #[dwctl_test_macros::test]
 async fn an_activation_without_standard_serves_and_prices_the_legacy_route(pool: PgPool) {
-    let f = Fixture::new(&pool).await;
+    let f = Fixture::with_config(&pool, |config| config.discovery.list_class_routes = true).await;
     activate_policy_classes(&f, &pool).await;
     sqlx::query("DELETE FROM model_serving_classes WHERE class_key = 'standard'")
         .execute(&pool)

@@ -218,6 +218,9 @@ pub struct Config {
     /// Both surfaces require authentication regardless of these flags.
     #[serde(default)]
     pub openapi: OpenApiConfig,
+    /// What model discovery (`GET /ai/v1/models`) lists. See [`DiscoveryConfig`].
+    #[serde(default)]
+    pub discovery: DiscoveryConfig,
     /// Cached-input pricing (the dwctl-owned cache layer): the on/off flag, the
     /// tokenizer-svc URL, and the default pricing multipliers. See [`CacheConfig`].
     #[serde(default)]
@@ -391,6 +394,16 @@ pub struct OpenApiConfig {
     /// Expose `/ai/openapi.json` and `/ai/docs`. Defaults to `true`;
     /// the routes require any authenticated identity.
     pub ai_enabled: bool,
+}
+
+/// Model discovery (`GET /ai/v1/models`).
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct DiscoveryConfig {
+    /// List each serving class of a class-routed model as its own entry
+    /// (`alias:<class>`) next to the model. Defaults to `false`: the classes
+    /// stay callable but unlisted until they are announced.
+    pub list_class_routes: bool,
 }
 
 impl Default for OpenApiConfig {
@@ -3529,6 +3542,7 @@ impl Default for Config {
             image_normalizer: crate::image_normalizer::ImageNormalizerConfig::default(),
             keystore: None,
             openapi: OpenApiConfig::default(),
+            discovery: DiscoveryConfig::default(),
             cache: CacheConfig::default(),
             clickhouse: None,
             prefix_chain: crate::prefix_chain::PrefixChainConfig::default(),

@@ -289,8 +289,11 @@ pub async fn list_ai_models<P: PoolProvider>(
         .map_err(|e| database_error("list_accessible_models", e))?;
 
     // A class-routed model also answers to `alias:<class>` for each class
-    // other than standard; list those beside the model.
-    let class_routes: Vec<(String, String)> = {
+    // other than standard; list those beside the model when discovery lists
+    // classes. Unlisted classes stay callable.
+    let class_routes: Vec<(String, String)> = if !state.config.snapshot().discovery.list_class_routes {
+        Vec::new()
+    } else {
         let model_ids = rows.iter().map(|row| row.get::<uuid::Uuid, _>("id")).collect::<Vec<_>>();
         sqlx::query_as(
             "SELECT dm.alias, c.class_key FROM model_serving_classes c

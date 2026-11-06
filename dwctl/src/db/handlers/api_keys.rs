@@ -2697,6 +2697,7 @@ mod tests {
             connections: Default::default(),
             image_normalizer: Default::default(),
             openapi: Default::default(),
+            discovery: Default::default(),
             cache: Default::default(),
             clickhouse: None,
             prefix_chain: crate::prefix_chain::PrefixChainConfig::default(),

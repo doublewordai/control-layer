@@ -17,6 +17,7 @@ use crate::{
         },
     },
     db::errors::Result,
+    inference::serving_name::split_served,
 };
 use rust_decimal::Decimal;
 use rust_decimal::prelude::ToPrimitive;
@@ -740,7 +741,8 @@ struct UserUsageRow {
 /// successful (2xx) requests (see `refresh_user_model_usage_daily`), so failed
 /// requests don't inflate the counts. Because it is keyed by UTC `usage_date`,
 /// the range is whole-UTC-day and `last_active_at` is day-granular
-/// (`MAX(usage_date)`), not the exact last-request timestamp.
+/// (`MAX(usage_date)`), not the exact last-request timestamp. A model's class
+/// routes (`alias:<class>`, rolled up separately) count towards the model.
 #[instrument(level = "debug", skip(db), err)]
 pub async fn get_model_user_usage(
     db: &PgPool,
@@ -763,7 +765,7 @@ pub async fn get_model_user_usage(
             (MAX(umu.usage_date)::timestamp AT TIME ZONE 'UTC') as last_active_at
         FROM user_model_usage_daily umu
         LEFT JOIN users u ON u.id = umu.user_id
-        WHERE umu.model = $1
+        WHERE (umu.model = $1 OR starts_with(umu.model, $1 || ':'))
             AND umu.usage_date >= ($2::timestamptz AT TIME ZONE 'UTC')::date
             AND umu.usage_date <= ($3::timestamptz AT TIME ZONE 'UTC')::date
         GROUP BY umu.user_id, u.email
@@ -784,7 +786,7 @@ pub async fn get_model_user_usage(
             COALESCE(SUM(input_tokens + output_tokens), 0)::bigint as total_tokens,
             SUM(cost)::float8 as total_cost
         FROM user_model_usage_daily
-        WHERE model = $1
+        WHERE (model = $1 OR starts_with(model, $1 || ':'))
             AND usage_date >= ($2::timestamptz AT TIME ZONE 'UTC')::date
             AND usage_date <= ($3::timestamptz AT TIME ZONE 'UTC')::date
         "#,
@@ -1175,6 +1177,10 @@ const USAGE_DAILY_REFRESH_LOCK: i64 = 0x4457_4354_5553_4744;
 /// The `WHERE id > last_processed_id` scan is disjoint from the one-off backfill's
 /// `WHERE id <= backfill_watermark`, so the two can run concurrently without double
 /// counting (a day straddling the boundary gets each side summed via the additive upsert).
+///
+/// Traffic to a class route (`alias:<class>`, recorded as the model with that class
+/// requested and resolved) is rolled up as `alias:<class>`, so a customer's usage lists
+/// each class it used as its own entry. Standard-class traffic stays under the alias.
 #[instrument(level = "debug", skip(pool), err)]
 pub async fn refresh_user_model_usage_daily(pool: &PgPool) -> Result<()> {
     let mut tx = pool.begin().await?;
@@ -1210,17 +1216,25 @@ pub async fn refresh_user_model_usage_daily(pool: &PgPool) -> Result<()> {
         r#"
         INSERT INTO user_model_usage_daily (user_id, model, usage_date, input_tokens, output_tokens, cost, request_count)
         SELECT user_id,
-               model,
+               usage_model,
                (timestamp AT TIME ZONE 'UTC')::date,
                COALESCE(SUM(prompt_tokens), 0),
                COALESCE(SUM(completion_tokens), 0),
                COALESCE(SUM(total_cost), 0),
                COUNT(*)
-        FROM http_analytics
-        WHERE id > $1 AND id <= $2
-              AND user_id IS NOT NULL AND model IS NOT NULL
-              AND status_code BETWEEN 200 AND 299
-        GROUP BY user_id, model, (timestamp AT TIME ZONE 'UTC')::date
+        FROM (
+            SELECT user_id, timestamp, prompt_tokens, completion_tokens, total_cost,
+                   CASE WHEN requested_serving_class = resolved_serving_class
+                             AND resolved_serving_class <> 'standard'
+                        THEN model || ':' || resolved_serving_class
+                        ELSE model
+                   END AS usage_model
+            FROM http_analytics
+            WHERE id > $1 AND id <= $2
+                  AND user_id IS NOT NULL AND model IS NOT NULL
+                  AND status_code BETWEEN 200 AND 299
+        ) ha
+        GROUP BY user_id, usage_model, (timestamp AT TIME ZONE 'UTC')::date
         ON CONFLICT (user_id, model, usage_date)
         DO UPDATE SET
             input_tokens = user_model_usage_daily.input_tokens + EXCLUDED.input_tokens,
@@ -1252,8 +1266,34 @@ pub async fn refresh_user_model_usage_daily(pool: &PgPool) -> Result<()> {
 /// Load current realtime tariff rates keyed by model alias.
 /// Returns a map of model alias → (input_price_per_token, output_price_per_token).
 /// Only resolve models present in this usage response, including retired models.
+///
+/// A class entry (`alias:<class>`, as the usage rollup names class-route traffic) is
+/// priced as that class bills: the account's deal on the class, else the class's price.
 #[instrument(level = "debug", skip(pool), err)]
 pub async fn get_realtime_tariffs(pool: &PgPool, account: Uuid, models: &[String]) -> Result<HashMap<String, (Decimal, Decimal)>> {
+    let (mut class_aliases, mut classes) = (Vec::new(), Vec::new());
+    for model in models {
+        if let (alias, Some(class)) = split_served(model) {
+            class_aliases.push(alias.to_string());
+            classes.push(class.to_string());
+        }
+    }
+
+    let class_rows = sqlx::query!(
+        r#"
+        SELECT dm.alias || ':' || c.class AS "model!",
+               t.input_price_per_token as "input_price_per_token!", t.output_price_per_token as "output_price_per_token!"
+        FROM unnest($2::text[], $3::text[]) AS c(alias, class)
+        JOIN deployed_models dm ON dm.alias = c.alias
+        CROSS JOIN LATERAL effective_model_tariff(dm.id, $1, 'realtime', NULL, c.class, NOW()) t
+        "#,
+        account,
+        &class_aliases,
+        &classes
+    )
+    .fetch_all(pool)
+    .await?;
+
     let rows = sqlx::query!(
         r#"
         SELECT dm.alias, t.input_price_per_token as "input_price_per_token!", t.output_price_per_token as "output_price_per_token!"
@@ -1280,6 +1320,11 @@ pub async fn get_realtime_tariffs(pool: &PgPool, account: Uuid, models: &[String
     Ok(rows
         .into_iter()
         .map(|r| (r.alias, (r.input_price_per_token, r.output_price_per_token)))
+        .chain(
+            class_rows
+                .into_iter()
+                .map(|r| (r.model, (r.input_price_per_token, r.output_price_per_token))),
+        )
         .collect())
 }
 

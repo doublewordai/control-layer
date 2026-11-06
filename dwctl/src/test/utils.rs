@@ -449,6 +449,7 @@ pub fn create_test_config() -> crate::config::Config {
         connections: Default::default(),
         image_normalizer: Default::default(),
         openapi: Default::default(),
+        discovery: Default::default(),
         cache: Default::default(),
         continuation: Default::default(),
         heap_profiling: Default::default(),

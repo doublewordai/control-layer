@@ -1,0 +1,36 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n        SELECT dm.alias || ':' || c.class AS \"model!\",\n               t.input_price_per_token as \"input_price_per_token!\", t.output_price_per_token as \"output_price_per_token!\"\n        FROM unnest($2::text[], $3::text[]) AS c(alias, class)\n        JOIN deployed_models dm ON dm.alias = c.alias\n        CROSS JOIN LATERAL effective_model_tariff(dm.id, $1, 'realtime', NULL, c.class, NOW()) t\n        ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "model!",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 1,
+        "name": "input_price_per_token!",
+        "type_info": "Numeric"
+      },
+      {
+        "ordinal": 2,
+        "name": "output_price_per_token!",
+        "type_info": "Numeric"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "TextArray",
+        "TextArray"
+      ]
+    },
+    "nullable": [
+      null,
+      null,
+      null
+    ]
+  },
+  "hash": "399abe00fc2cc6ba0512f3dbe241c05004118a5d7a66f0629927d4ecf150bac4"
+}

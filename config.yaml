@@ -604,6 +604,13 @@ openapi:
   # any authenticated identity.
   ai_enabled: true
 
+# Model discovery (GET /ai/v1/models)
+discovery:
+  # List each serving class of a class-routed model (alias:<class>) as its own
+  # entry. Off by default: classes stay callable but unlisted until announced.
+  # Set via environment: DWCTL_DISCOVERY__LIST_CLASS_ROUTES=true
+  list_class_routes: false
+
 # Onwards AI proxy configuration
 # Controls behavior of the onwards routing layer for AI proxy requests
 onwards:
