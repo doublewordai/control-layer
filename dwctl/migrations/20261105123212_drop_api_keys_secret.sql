@@ -18,7 +18,7 @@ ALTER TABLE api_keys DROP COLUMN secret;
 
 -- Descriptions written while the plaintext column still existed.
 COMMENT ON COLUMN api_keys.secret_hash IS
-    'SHA-256 of the UTF-8 API key secret (32 bytes). The only stored form of a key''s secret; keys are looked up by it.';
+    'SHA-256 of the UTF-8 API key secret (32 bytes). The form keys are looked up and authenticated by; the secret itself is never stored in the clear.';
 COMMENT ON COLUMN api_keys.secret_prefix IS
     'Leading characters of the API key secret, kept for display.';
 COMMENT ON INDEX idx_api_keys_secret_hash IS
