@@ -99,7 +99,7 @@ impl SampleGenerator for VisionGenerator {
         &["vision"]
     }
 
-    fn generate(&self, model_alias: &str, api_key: &str, endpoint: &str, count: usize) -> Vec<RequestTemplateInput> {
+    fn generate(&self, model_alias: &str, endpoint: &str, count: usize) -> Vec<RequestTemplateInput> {
         let mut rng = rng();
 
         (0..count)
@@ -137,7 +137,7 @@ impl SampleGenerator for VisionGenerator {
                     method: "POST".to_string(),
                     path: "/v1/chat/completions".to_string(),
                     model: model_alias.to_string(),
-                    api_key: api_key.to_string(),
+                    api_key: String::new(),
                     body: body.to_string(),
                 }
             })
@@ -160,7 +160,7 @@ mod tests {
     #[test]
     fn test_vision_generator_output() {
         let generator = VisionGenerator;
-        let requests = generator.generate("gpt-4-vision", "test-key", "https://api.example.com", 10);
+        let requests = generator.generate("gpt-4-vision", "https://api.example.com", 10);
 
         assert_eq!(requests.len(), 10);
 
@@ -169,7 +169,7 @@ mod tests {
             assert_eq!(req.method, "POST");
             assert_eq!(req.path, "/v1/chat/completions");
             assert_eq!(req.model, "gpt-4-vision");
-            assert_eq!(req.api_key, "test-key");
+            assert!(req.api_key.is_empty());
 
             // Verify body is valid JSON with expected structure
             let body: serde_json::Value = serde_json::from_str(&req.body).unwrap();

@@ -30,11 +30,12 @@ impl<'c> Repository for PasswordResetTokens<'c> {
     type CreateRequest = PasswordResetTokenCreateRequest;
     type UpdateRequest = PasswordResetTokenUpdateRequest;
     type Response = PasswordResetTokenResponse;
+    type Created = PasswordResetTokenResponse;
     type Id = Uuid;
     type Filter = PasswordResetTokenFilter;
 
     #[instrument(level = "debug", skip(self, request), err)]
-    async fn create(&mut self, request: &Self::CreateRequest) -> Result<Self::Response> {
+    async fn create(&mut self, request: &Self::CreateRequest) -> Result<Self::Created> {
         let token_hash = password::hash_string_with_params(&request.raw_token, Some(request.argon2_params))
             .map_err(|e| DbError::Other(anyhow::anyhow!(e)))?;
 

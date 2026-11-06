@@ -617,11 +617,8 @@ pub async fn inference_middleware<P: PoolProvider + Clone + Send + Sync + 'stati
                 endpoint: state.loopback_base_url.clone(),
                 method: "POST".to_string(),
                 path: endpoint.clone(),
-                // An internal credential is not a key and is never stored.
-                api_key: api_key
-                    .clone()
-                    .filter(|key| !crate::auth::internal_credential::is_internal(key))
-                    .unwrap_or_default(),
+                // The presented key is never stored.
+                api_key: String::new(),
                 created_by: created_by.unwrap_or_default(),
             };
             let client_usage = super::stream_usage::requested_usage(&endpoint, &request_value);
@@ -761,13 +758,8 @@ pub async fn inference_middleware<P: PoolProvider + Clone + Send + Sync + 'stati
             };
 
             // The daemon dispatches as the hidden batch key (or the caller's
-            // cap-scope child), authenticating each attempt from its id. The
-            // secret is still stored for the previous release's daemons
-            // (until DW-1012).
-            let queued_api_key = queued_batch_key
-                .as_ref()
-                .map(|key| key.secret.clone())
-                .unwrap_or_else(|| api_key.clone().unwrap_or_default());
+            // cap-scope child), authenticating each attempt from its id. No
+            // key secret is stored.
             let queued_api_key_id = queued_batch_key.as_ref().map(|key| key.id);
             let queued_created_by = queued_batch_key
                 .as_ref()
@@ -795,7 +787,7 @@ pub async fn inference_middleware<P: PoolProvider + Clone + Send + Sync + 'stati
                     endpoint: state.loopback_base_url.clone(),
                     method: "POST".to_string(),
                     path: endpoint.clone(),
-                    api_key: queued_api_key,
+                    api_key: String::new(),
                     created_by: queued_created_by,
                     metadata: queued_metadata,
                 };
@@ -819,7 +811,7 @@ pub async fn inference_middleware<P: PoolProvider + Clone + Send + Sync + 'stati
                 endpoint: state.loopback_base_url.clone(),
                 method: "POST".to_string(),
                 path: endpoint.clone(),
-                api_key: queued_api_key,
+                api_key: String::new(),
                 created_by: queued_created_by,
                 metadata: queued_metadata,
             };
@@ -855,7 +847,6 @@ struct FlexBatchApiKey {
     id: ApiKeyId,
     /// The client's key, which `id` is dispatched on behalf of.
     client_key_id: ApiKeyId,
-    secret: String,
     key_owner_id: uuid::Uuid,
     /// The key owner's `users.verified` flag (organizations are `users` rows
     /// too). Rides along on this lookup so the unverified upload-volume cap on
@@ -925,13 +916,9 @@ async fn resolve_flex_batch_api_key(pool: &sqlx::PgPool, api_key: Option<&ApiKey
                 .await?
         }
     };
-    // Fusillade still dispatches with a stored key (until DW-1010).
-    let secret = api_keys_repo.legacy_dispatch_secret(key_id).await?;
-
     Ok(Some(FlexBatchApiKey {
         id: key_id,
         client_key_id,
-        secret,
         key_owner_id,
         verified,
     }))
@@ -1949,17 +1936,16 @@ mod tests {
             .expect("resolve flex key")
             .expect("known realtime key should resolve");
 
-        assert_ne!(flex_key.secret, realtime_key);
         assert_eq!(flex_key.key_owner_id, org.id);
 
         let row = sqlx::query(
             r#"
             SELECT user_id, created_by, purpose, hidden
             FROM api_keys
-            WHERE secret = $1
+            WHERE id = $1
             "#,
         )
-        .bind(&flex_key.secret)
+        .bind(flex_key.id)
         .fetch_one(&pool)
         .await
         .expect("hidden key row");

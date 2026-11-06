@@ -792,7 +792,8 @@ async fn test_daemon_claims_and_completes_request(pool: sqlx::PgPool) {
     let calls = http_client.get_calls();
     assert_eq!(calls[0].method, "POST");
     assert_eq!(calls[0].path, "/v1/test");
-    assert_eq!(calls[0].api_key, "test-key");
+    // No key is stored with a request: a processor sets the dispatch credential.
+    assert_eq!(calls[0].api_key, "");
 }
 
 #[sqlx::test(migrator = "fusillade_arsenal::MIGRATOR")]
@@ -2505,15 +2506,11 @@ async fn test_route_at_claim_time_escalation(pool: sqlx::PgPool) {
 
     assert!(completed, "Request did not complete within timeout");
 
-    // Verify the HTTP call was made with the ESCALATION model (routed at claim time)
-    // Note: With route-at-claim-time escalation, the original API key is used
-    // (batch API keys automatically have access to escalation models in the onwards cache)
+    // Verify the HTTP call was made with the ESCALATION model (routed at claim time).
+    // No key is stored with a request, so none is handed to the dispatch.
     assert_eq!(http_client.call_count(), 1);
     let calls = http_client.get_calls();
-    assert_eq!(
-        calls[0].api_key, "original-key",
-        "Should use original API key (escalation only changes model routing)"
-    );
+    assert_eq!(calls[0].api_key, "", "no stored key reaches the dispatch");
     // The escalation is verified by the request completing successfully with the
     // escalated model's response. The model change happens at claim time in the daemon.
 }
@@ -2638,13 +2635,10 @@ async fn test_route_at_claim_time_no_escalation_when_enough_time(pool: sqlx::PgP
 
     assert!(completed, "Request did not complete within timeout");
 
-    // Verify the HTTP call used the ORIGINAL API key (no escalation)
+    // Verify the HTTP call was made (no escalation); no stored key reaches it.
     assert_eq!(http_client.call_count(), 1);
     let calls = http_client.get_calls();
-    assert_eq!(
-        calls[0].api_key, "original-key",
-        "Should use original API key when time remaining is above threshold"
-    );
+    assert_eq!(calls[0].api_key, "", "no stored key reaches the dispatch");
 }
 
 /// Tests for `get_batch_results_stream` and `stream_batch_results`.

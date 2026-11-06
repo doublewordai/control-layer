@@ -111,10 +111,6 @@ pub struct RawCompletedRequest {
     pub model: String,
     /// API path (e.g. `/v1/responses`, `/v1/chat/completions`).
     pub endpoint: String,
-    /// Bearer token from the Authorization header. Stored on the synthesized
-    /// template only on the INSERT path; the daemon never claims these rows
-    /// so the upstream call has already used this key.
-    pub api_key: String,
     /// Resolved user/org ID for the request (XOR-paired with batch_id on
     /// the fusillade row; required non-empty for batchless rows).
     pub created_by: String,
@@ -132,7 +128,7 @@ pub struct RawCompletedRequest {
 /// Byte definition used by the writer body gauges: the heap bytes actually
 /// allocated for the record's `request_body` and `response_body`
 /// (`String::capacity()`), summed. Those are the only unbounded strings on a
-/// record; `model`, `endpoint`, `api_key` and `created_by` are header-sized and
+/// record; `model`, `endpoint` and `created_by` are header-sized and
 /// deliberately excluded so the gauges measure the burst-amplifying payload,
 /// not bookkeeping. Constants of the definition live here so the queued, batch
 /// and clone-accounting paths cannot drift apart.
@@ -545,7 +541,8 @@ impl<P: PoolProvider + Clone + Send + Sync + 'static> RequestsWriter<P> {
                         endpoint: String::new(),
                         method: "POST".to_string(),
                         path: record.endpoint.clone(),
-                        api_key: record.api_key.clone(),
+                        // Realtime rows are never dispatched; no key is stored.
+                        api_key: String::new(),
                         created_by: record.created_by.clone(),
                         started_at: record.started_at,
                         completed_at: record.completed_at,
@@ -773,7 +770,6 @@ mod tests {
             request_body: r#"{"input":"hi"}"#.to_owned(),
             model: "test-model".to_owned(),
             endpoint: "/v1/responses".to_owned(),
-            api_key: "sk-test".to_owned(),
             created_by: "test-owner".to_owned(),
             started_at: now,
             completed_at: now,
@@ -913,7 +909,6 @@ mod tests {
                 request_body: r#"{"input":"hi"}"#.to_string(),
                 model: "gpt-4".to_string(),
                 endpoint: "/v1/responses".to_string(),
-                api_key: String::new(),
                 created_by: "user-test".to_string(),
                 started_at,
                 completed_at,
@@ -964,7 +959,6 @@ mod tests {
                     request_body: r#"{"input":"hi"}"#.to_string(),
                     model: "gpt-4".to_string(),
                     endpoint: "/v1/responses".to_string(),
-                    api_key: String::new(),
                     created_by: "user-test".to_string(),
                     started_at: Utc::now(),
                     completed_at: Utc::now(),
@@ -1008,7 +1002,6 @@ mod tests {
             request_body: r#"{"input":"safe"}"#.to_owned(),
             model: "test-model".to_owned(),
             endpoint: "/v1/responses".to_owned(),
-            api_key: String::new(),
             created_by: "test-owner".to_owned(),
             started_at: now,
             completed_at: now,
@@ -1038,7 +1031,6 @@ mod tests {
         const REQUEST_SENTINEL: &str = "private-request-payload-b83b1a";
         const RESPONSE_SENTINEL: &str = "private-response-payload-66f319";
         const MODEL_SENTINEL: &str = "private-model-c13fa2";
-        const API_KEY_SENTINEL: &str = "private-api-key-220b39";
         const OWNER_SENTINEL: &str = "private-owner-d34fb4";
         const DATABASE_SENTINEL: &str = "raw-database-error-566e2d";
         const POSITIVE_CONTROL: &str = "writer-log-capture-positive-control";
@@ -1088,7 +1080,6 @@ mod tests {
             request_body: REQUEST_SENTINEL.to_owned(),
             model: MODEL_SENTINEL.to_owned(),
             endpoint: "/v1/responses".to_owned(),
-            api_key: API_KEY_SENTINEL.to_owned(),
             created_by: OWNER_SENTINEL.to_owned(),
             started_at: now,
             completed_at: now,
@@ -1109,7 +1100,6 @@ mod tests {
             REQUEST_SENTINEL,
             RESPONSE_SENTINEL,
             MODEL_SENTINEL,
-            API_KEY_SENTINEL,
             OWNER_SENTINEL,
             DATABASE_SENTINEL,
         ] {
@@ -1174,7 +1164,6 @@ mod tests {
                 request_body: r#"{"input":"hi"}"#.to_string(),
                 model: "gpt-4".to_string(),
                 endpoint: "/v1/responses".to_string(),
-                api_key: String::new(),
                 created_by: "user-test".to_string(),
                 started_at: Utc::now(),
                 completed_at: Utc::now(),

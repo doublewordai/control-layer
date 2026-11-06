@@ -171,12 +171,10 @@ impl OpenAIBatchRequest {
     ///
     /// # Arguments
     /// * `endpoint` - The target endpoint (e.g., "http://localhost:8080/ai")
-    /// * `api_key` - The API key to inject for request execution
     /// * `accessible_models` - Model type and effective reasoning policy by alias
     fn to_internal(
         &self,
         endpoint: &str,
-        api_key: String,
         accessible_models: &HashMap<String, AccessibleBatchModel>,
         retired_models: &HashMap<String, String>,
         allowed_url_paths: &[String],
@@ -261,7 +259,8 @@ impl OpenAIBatchRequest {
             path: self.url.clone(),
             body,
             model,
-            api_key: api_key.to_string(),
+            // Dispatched as the batch's api_key_id; no key is stored.
+            api_key: String::new(),
         })
     }
 
@@ -835,7 +834,6 @@ fn resolve_upload_stream_result(
 /// Context for validating and routing requests parsed from file uploads.
 struct FileRequestContext {
     endpoint: String,
-    api_key: String,
     accessible_models: HashMap<String, AccessibleBatchModel>,
     retired_models: HashMap<String, String>,
     allowed_url_paths: Vec<String>,
@@ -883,7 +881,6 @@ fn create_file_stream(
 ) -> FileStreamResult {
     let FileRequestContext {
         endpoint,
-        api_key,
         accessible_models,
         retired_models,
         allowed_url_paths,
@@ -1104,7 +1101,6 @@ fn create_file_stream(
                                             // Transform to internal format (includes model access validation)
                                             match openai_req.to_internal(
                                                 &endpoint,
-                                                api_key.clone(),
                                                 &accessible_models,
                                                 &retired_models,
                                                 &allowed_url_paths,
@@ -1208,7 +1204,6 @@ fn create_file_stream(
                                 Ok(openai_req) => {
                                     match openai_req.to_internal(
                                         &endpoint,
-                                        api_key.clone(),
                                         &accessible_models,
                                         &retired_models,
                                         &allowed_url_paths,
@@ -1429,17 +1424,14 @@ pub async fn upload_file<P: PoolProvider>(
 
     // Get or create user-specific hidden batch API key for batch request execution.
     // We need the key ID for per-member attribution within orgs.
-    // A capped authenticating key resolves to its cap-scope child (the template
-    // key is only the legacy COALESCE fallback for batches without their own
-    // key, but keep it scope-consistent with batch creation).
+    // A capped authenticating key resolves to its cap-scope child, keeping it
+    // scope-consistent with batch creation.
     let mut conn = state.db.write().acquire().await.map_err(|e| Error::Database(e.into()))?;
     let mut api_keys_repo = ApiKeys::new(&mut conn);
     let api_key_id = api_keys_repo
         .resolve_batch_execution_key(target_user_id, current_user.id, current_user.api_key_id)
         .await
         .map_err(Error::Database)?;
-    // Fusillade still dispatches request templates with a stored key (until DW-1010).
-    let user_api_key = api_keys_repo.legacy_dispatch_secret(api_key_id).await.map_err(Error::Database)?;
 
     // The account's resolved scheduling tolerations, if it is pinned to a
     // preset. The hidden batch key belongs to the account that owns the batch
@@ -1454,10 +1446,8 @@ pub async fn upload_file<P: PoolProvider>(
     // account's policy straight off the users row, reusing the connection `conn`
     // this handler already holds — a cached account on Default is not a miss, so
     // an ordinary upload never takes a second connection.
-    let tolerations = match state
-        .key_policy_cache
-        .account_tolerations_if_known(&crate::crypto::hash_api_key(&user_api_key))
-    {
+    let key_hash = api_keys_repo.get_secret_hash(api_key_id).await.map_err(Error::Database)?;
+    let tolerations = match key_hash.and_then(|hash| state.key_policy_cache.account_tolerations_if_known(&hash)) {
         Some(resolved) => resolved,
         None => {
             let policy = crate::sync::key_policy::load_policy(&mut conn, target_user_id)
@@ -1509,7 +1499,6 @@ pub async fn upload_file<P: PoolProvider>(
         uploaded_by,
         FileRequestContext {
             endpoint,
-            api_key: user_api_key,
             accessible_models,
             retired_models,
             allowed_url_paths: config.batches.allowed_url_paths.clone(),

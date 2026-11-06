@@ -1,0 +1,108 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n            INSERT INTO api_keys (name, description, purpose, user_id, created_by, hidden, spend_limit, spend_limit_interval, secret_hash, secret_prefix)\n            VALUES ($1, $2, $3, $4, $5, false, $6, $7, $8, $9)\n            RETURNING id, name, description, user_id, created_at, last_used, purpose, hidden, is_deleted, created_by, spend_limit, spend_limit_interval, parent_api_key_id, secret_revealed_at\n            ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "id",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 1,
+        "name": "name",
+        "type_info": "Varchar"
+      },
+      {
+        "ordinal": 2,
+        "name": "description",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 3,
+        "name": "user_id",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 4,
+        "name": "created_at",
+        "type_info": "Timestamptz"
+      },
+      {
+        "ordinal": 5,
+        "name": "last_used",
+        "type_info": "Timestamptz"
+      },
+      {
+        "ordinal": 6,
+        "name": "purpose",
+        "type_info": "Varchar"
+      },
+      {
+        "ordinal": 7,
+        "name": "hidden",
+        "type_info": "Bool"
+      },
+      {
+        "ordinal": 8,
+        "name": "is_deleted",
+        "type_info": "Bool"
+      },
+      {
+        "ordinal": 9,
+        "name": "created_by",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 10,
+        "name": "spend_limit",
+        "type_info": "Numeric"
+      },
+      {
+        "ordinal": 11,
+        "name": "spend_limit_interval",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 12,
+        "name": "parent_api_key_id",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 13,
+        "name": "secret_revealed_at",
+        "type_info": "Timestamptz"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Varchar",
+        "Text",
+        "Varchar",
+        "Uuid",
+        "Uuid",
+        "Numeric",
+        "Text",
+        "Bytea",
+        "Text"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      true,
+      false,
+      false,
+      true,
+      false,
+      false,
+      false,
+      false,
+      true,
+      true,
+      true,
+      true
+    ]
+  },
+  "hash": "f24e3f8beafaa8476941783dd41e8b4beaed8ec7fbc8077685b88b1e6184a59d"
+}

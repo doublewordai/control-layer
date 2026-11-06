@@ -1156,7 +1156,7 @@ mod tests {
             .get_or_create_hidden_key(user, ApiKeyPurpose::Batch, user)
             .await
             .expect("hidden batch key");
-        repo.legacy_dispatch_secret(id).await.expect("hidden batch key secret")
+        crate::test::utils::bearer_for_key(pool, id).await
     }
 
     /// Put an image in the store WITHOUT any `image_access` row — the state a

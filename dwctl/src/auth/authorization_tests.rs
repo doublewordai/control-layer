@@ -628,8 +628,14 @@ async fn reserved_system_key_can_provision_and_retire_accounts(pool: PgPool) {
     let (app, _services) = create_test_app(pool.clone(), false).await;
     let secret = crate::crypto::generate_api_key();
     let hash = crate::crypto::hash_api_key(&secret);
-    let installed = sqlx::query("UPDATE api_keys SET secret = $1, secret_hash = $2, secret_prefix = $3, purpose = 'platform' WHERE id = '00000000-0000-0000-0000-000000000000'")
-        .bind(&secret).bind(&hash[..]).bind(crate::crypto::api_key_prefix(&secret)).execute(&pool).await.unwrap();
+    let installed = sqlx::query(
+        "UPDATE api_keys SET secret_hash = $1, secret_prefix = $2, purpose = 'platform' WHERE id = '00000000-0000-0000-0000-000000000000'",
+    )
+    .bind(&hash[..])
+    .bind(crate::crypto::api_key_prefix(&secret))
+    .execute(&pool)
+    .await
+    .unwrap();
     assert_eq!(installed.rows_affected(), 1);
     let bearer = format!("Bearer {secret}");
     let created = app.post("/admin/api/v1/users").add_header("Authorization", &bearer)

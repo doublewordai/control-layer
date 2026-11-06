@@ -25,6 +25,10 @@ pub trait Repository {
     /// The response/DTO type returned by operations
     type Response;
 
+    /// What `create` returns: usually [`Self::Response`], or more when the
+    /// create alone can hand something back (an API key's secret).
+    type Created;
+
     /// The identifier type for lookups
     type Id: Send + Sync;
 
@@ -32,7 +36,7 @@ pub trait Repository {
     type Filter: Send + Sync;
 
     /// Create a new entity
-    async fn create(&mut self, request: &Self::CreateRequest) -> Result<Self::Response>;
+    async fn create(&mut self, request: &Self::CreateRequest) -> Result<Self::Created>;
 
     /// Get an entity by ID
     async fn get_by_id(&mut self, id: Self::Id) -> Result<Option<Self::Response>>;

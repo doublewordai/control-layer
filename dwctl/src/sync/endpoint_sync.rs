@@ -877,10 +877,11 @@ mod tests {
         type CreateRequest = DeploymentCreateDBRequest;
         type UpdateRequest = DeploymentUpdateDBRequest;
         type Response = DeploymentDBResponse;
+        type Created = DeploymentDBResponse;
         type Id = DeploymentId;
         type Filter = DeploymentFilter;
 
-        async fn create(&mut self, request: &Self::CreateRequest) -> Result<Self::Response> {
+        async fn create(&mut self, request: &Self::CreateRequest) -> Result<Self::Created> {
             let deployments = self.deployments.read().await;
             if let Some(_existing) = deployments.values().find(|d| d.alias == request.alias) {
                 return Err(crate::db::errors::DbError::UniqueViolation {

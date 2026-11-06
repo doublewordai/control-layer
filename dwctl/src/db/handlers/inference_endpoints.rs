@@ -75,11 +75,12 @@ impl<'c> Repository for InferenceEndpoints<'c> {
     type CreateRequest = InferenceEndpointCreateDBRequest;
     type UpdateRequest = InferenceEndpointUpdateDBRequest;
     type Response = InferenceEndpointDBResponse;
+    type Created = InferenceEndpointDBResponse;
     type Id = InferenceEndpointId;
     type Filter = InferenceEndpointFilter;
 
     #[instrument(level = "debug", skip(self, request), fields(name = %request.name, url = %request.url), err)]
-    async fn create(&mut self, request: &Self::CreateRequest) -> Result<Self::Response> {
+    async fn create(&mut self, request: &Self::CreateRequest) -> Result<Self::Created> {
         let reasoning_translation = request
             .reasoning_translation
             .as_ref()

@@ -808,20 +808,15 @@ pub async fn create_batch<P: PoolProvider>(
     };
 
     // Get the hidden API key for batch execution and per-member attribution.
-    // The secret is stored on the batch so the daemon uses the batch creator's
-    // credentials, not the file uploader's key from request_templates.
+    // Its id is stored on the batch so the daemon dispatches as the batch
+    // creator, not the file uploader.
     // If the request was authenticated with a capped API key, this resolves to
     // that key's cap-scope child instead of the shared member key, so the
     // batch's spend counts against the authenticating key's spending cap.
-    let (batch_api_key, api_key_id, target_verified) = {
+    let (api_key_id, target_verified) = {
         let mut conn = state.db.write().acquire().await.map_err(|e| Error::Database(e.into()))?;
         let key_id = ApiKeys::new(&mut conn)
             .resolve_batch_execution_key(target_user_id, attribution_user_id, authenticating_key_id)
-            .await
-            .map_err(Error::Database)?;
-        // Fusillade still dispatches batches with a stored key (until DW-1010).
-        let secret = ApiKeys::new(&mut conn)
-            .legacy_dispatch_secret(key_id)
             .await
             .map_err(Error::Database)?;
         // A capped authenticating key can resolve to a different billing
@@ -862,7 +857,7 @@ pub async fn create_batch<P: PoolProvider>(
         // Verification and outstanding-volume accounting use the same active
         // account. Execution-account balance admission is checked separately.
         let verified = Users::new(&mut conn).is_verified(target_user_id).await?;
-        (secret, key_id, verified)
+        (key_id, verified)
     };
 
     // Convert metadata to HashMap and inject request_source and user info.
@@ -915,7 +910,7 @@ pub async fn create_batch<P: PoolProvider>(
                 metadata,
                 created_by: Some(target_user_id.to_string()),
                 api_key_id: Some(api_key_id),
-                api_key: Some(batch_api_key),
+                api_key: None,
                 total_requests: Some(total_requests),
             })
             .await
@@ -947,7 +942,7 @@ pub async fn create_batch<P: PoolProvider>(
             metadata,
             created_by: Some(target_user_id.to_string()),
             api_key_id: Some(api_key_id),
-            api_key: Some(batch_api_key),
+            api_key: None,
             total_requests: Some(total_requests),
         };
 

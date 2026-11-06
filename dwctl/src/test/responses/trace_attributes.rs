@@ -93,11 +93,12 @@ async fn customer_attributes_on_request_spans(pool: sqlx::PgPool) {
     let mock = wiremock::MockServer::start().await;
     super::mount_chat_completions_mock(&mock).await;
     let (server, key, bg) = super::setup_ai_test(pool.clone(), &mock, true).await;
-    let (owner, key_id): (uuid::Uuid, uuid::Uuid) = sqlx::query_as("SELECT user_id, id FROM api_keys WHERE secret = $1")
-        .bind(&key)
-        .fetch_one(&pool)
-        .await
-        .unwrap();
+    let (owner, key_id): (uuid::Uuid, uuid::Uuid) =
+        sqlx::query_as("SELECT user_id, id FROM api_keys WHERE secret_hash = sha256(convert_to($1, 'UTF8'))")
+            .bind(&key)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
     sqlx::query("UPDATE users SET display_name = 'Example Trading Ltd' WHERE id = $1")
         .bind(owner)
         .execute(&pool)

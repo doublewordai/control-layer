@@ -69,7 +69,6 @@ pub fn find_matching_model(deployments: &[DeploymentDBResponse], generator: &dyn
 /// # Arguments
 /// * `storage` - The fusillade storage implementation
 /// * `user_id` - The user's UUID
-/// * `api_key` - The user's batch API key for request execution
 /// * `endpoint` - The batch execution endpoint URL
 /// * `accessible_deployments` - List of deployments the user has access to
 /// * `config` - Sample files configuration
@@ -79,7 +78,6 @@ pub fn find_matching_model(deployments: &[DeploymentDBResponse], generator: &dyn
 pub async fn create_sample_files_for_user<S: Storage>(
     storage: &S,
     user_id: Uuid,
-    api_key: &str,
     endpoint: &str,
     accessible_deployments: &[DeploymentDBResponse],
     config: &SampleFilesConfig,
@@ -101,7 +99,7 @@ pub async fn create_sample_files_for_user<S: Storage>(
         };
 
         // Generate requests using the generator
-        let templates = generator.generate(&model_alias, api_key, endpoint, config.requests_per_file);
+        let templates = generator.generate(&model_alias, endpoint, config.requests_per_file);
 
         // Calculate file size (each template serialized as JSON + newline)
         let size_bytes: i64 = templates

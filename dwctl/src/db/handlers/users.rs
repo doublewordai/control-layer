@@ -181,11 +181,12 @@ impl<'c> Repository for Users<'c> {
     type CreateRequest = UserCreateDBRequest;
     type UpdateRequest = UserUpdateDBRequest;
     type Response = UserDBResponse;
+    type Created = UserDBResponse;
     type Id = UserId;
     type Filter = UserFilter;
 
     #[instrument(level = "debug", skip(self, request), fields(username = %request.username), err)]
-    async fn create(&mut self, request: &Self::CreateRequest) -> Result<Self::Response> {
+    async fn create(&mut self, request: &Self::CreateRequest) -> Result<Self::Created> {
         // Always generate a new ID for users
         let user_id = Uuid::new_v4();
 
