@@ -1,5 +1,16 @@
 # Changelog
 
+## [17.0.0](https://github.com/doublewordai/control-layer/compare/v16.6.0...v17.0.0) (2026-11-06)
+
+
+### ⚠ BREAKING CHANGES
+
+* **fusillade:** drop the plaintext API key columns (DW-1013) ([#2173](https://github.com/doublewordai/control-layer/issues/2173))
+
+### Features
+
+* **fusillade:** drop the plaintext API key columns (DW-1013) ([#2173](https://github.com/doublewordai/control-layer/issues/2173)) ([e3c4de0](https://github.com/doublewordai/control-layer/commit/e3c4de08db28366fdce9c04b42cf87d5abf40244))
+
 ## [16.6.0](https://github.com/doublewordai/control-layer/compare/v16.5.0...v16.6.0) (2026-11-06)
 
 
