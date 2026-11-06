@@ -1269,6 +1269,7 @@ pub async fn refresh_user_model_usage_daily(pool: &PgPool) -> Result<()> {
 ///
 /// A class entry (`alias:<class>`, as the usage rollup names class-route traffic) is
 /// priced as that class bills: the account's deal on the class, else the class's price.
+/// Once a model's class routes are inactive, its class entries are priced as standard.
 #[instrument(level = "debug", skip(pool), err)]
 pub async fn get_realtime_tariffs(pool: &PgPool, account: Uuid, models: &[String]) -> Result<HashMap<String, (Decimal, Decimal)>> {
     let (mut class_aliases, mut classes) = (Vec::new(), Vec::new());
@@ -1285,7 +1286,8 @@ pub async fn get_realtime_tariffs(pool: &PgPool, account: Uuid, models: &[String
                t.input_price_per_token as "input_price_per_token!", t.output_price_per_token as "output_price_per_token!"
         FROM unnest($2::text[], $3::text[]) AS c(alias, class)
         JOIN deployed_models dm ON dm.alias = c.alias
-        CROSS JOIN LATERAL effective_model_tariff(dm.id, $1, 'realtime', NULL, c.class, NOW()) t
+        CROSS JOIN LATERAL effective_model_tariff(dm.id, $1, 'realtime', NULL,
+            CASE WHEN class_routes_active(dm.id) THEN c.class ELSE 'standard' END, NOW()) t
         "#,
         account,
         &class_aliases,

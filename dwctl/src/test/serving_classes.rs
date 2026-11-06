@@ -548,6 +548,31 @@ async fn class_routes_serve_realtime_by_class_and_bill_the_class(pool: PgPool) {
         .unwrap();
     assert_eq!(prices["policy"], (Decimal::new(2, 6), Decimal::new(2, 6)));
     assert_eq!(prices["policy:fast"], (Decimal::new(4, 6), Decimal::new(4, 6)));
+    // An account's own class price applies while the class routes are active;
+    // once they are rolled back, class entries are priced as standard.
+    sqlx::query(
+        "INSERT INTO model_tariffs (deployed_model_id,user_id,serving_class,name,input_price_per_token,output_price_per_token,api_key_purpose)
+         SELECT id, $1, 'fast', 'deal', 0.000003, 0.000003, 'realtime' FROM deployed_models WHERE alias = 'policy'",
+    )
+    .bind(f.user)
+    .execute(&pool)
+    .await
+    .unwrap();
+    let fast_price = || async {
+        crate::db::handlers::analytics::get_realtime_tariffs(&pool, f.user, &["policy:fast".to_owned()])
+            .await
+            .unwrap()["policy:fast"]
+    };
+    assert_eq!(fast_price().await, (Decimal::new(3, 6), Decimal::new(3, 6)));
+    sqlx::query("UPDATE deployed_models SET routing_mode = 'legacy' WHERE alias = 'policy'")
+        .execute(&pool)
+        .await
+        .unwrap();
+    let standard = crate::db::handlers::analytics::get_realtime_tariffs(&pool, f.user, &["policy".to_owned()])
+        .await
+        .unwrap()["policy"];
+    assert_eq!(fast_price().await, standard);
+    assert_ne!(standard, (Decimal::new(3, 6), Decimal::new(3, 6)));
     // The model's users table counts its classes towards the model.
     let by_user = crate::db::handlers::analytics::get_model_user_usage(
         &pool,
