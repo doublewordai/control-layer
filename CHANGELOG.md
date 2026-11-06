@@ -1,5 +1,12 @@
 # Changelog
 
+## [17.1.0](https://github.com/doublewordai/control-layer/compare/v17.0.0...v17.1.0) (2026-11-06)
+
+
+### Features
+
+* list class usage separately and keep class routes unlisted by default ([#2178](https://github.com/doublewordai/control-layer/issues/2178)) ([85f2ef3](https://github.com/doublewordai/control-layer/commit/85f2ef3a80ab55b0ef70643e4c8058eecb91614d))
+
 ## [17.0.0](https://github.com/doublewordai/control-layer/compare/v16.6.0...v17.0.0) (2026-11-06)
 
 
