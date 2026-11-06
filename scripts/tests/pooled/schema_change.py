@@ -25,42 +25,49 @@ def verify_concurrent_model_name_writes(app, direct, pooled_dsn):
         }, timeout=20)
         response.raise_for_status()
         model_id = response.json()["id"]
-        for reserved in (alias + ":fast", alias + "-fast"):
-            # Reproduce catalog's transaction/lock protocol on a pooled connection.
-            # The Rust integration test separately exercises the actual reconciler.
-            with ThreadPoolExecutor(max_workers=1) as executor:
-                with psycopg.connect(pooled_dsn) as catalog:
-                    catalog.execute("SELECT pg_advisory_xact_lock(%s)", (0x44574D4F44454C50,))
-                    pid = catalog.execute("SELECT pg_backend_pid()").fetchone()[0]
-                    class_id = catalog.execute(
-                        "INSERT INTO model_serving_classes "
-                        "(deployed_model_id,class_key,display_name,inference_endpoint_id,upstream_model_name) "
-                        "VALUES (%s,'fast','Fast',%s,'pooled-fast-upstream') "
-                        "ON CONFLICT (deployed_model_id,class_key) DO UPDATE SET display_name=EXCLUDED.display_name "
-                        "RETURNING id", (model_id, endpoint),
-                    ).fetchone()[0]
-                    if reserved.endswith("-fast"):
-                        catalog.execute(
-                            "INSERT INTO model_aliases (alias,deployed_model_id,serving_class_id) VALUES (%s,%s,%s)",
-                            (reserved, model_id, class_id),
-                        )
-                    pending = executor.submit(session.post, base + "/admin/api/v1/models", json={
-                        "type": "standard", "model_name": reserved, "alias": reserved,
-                        "hosted_on": endpoint,
-                    }, timeout=20)
-                    deadline = time.monotonic() + 10
-                    while not direct.execute(
-                        "SELECT EXISTS (SELECT 1 FROM pg_stat_activity "
-                        "WHERE %s = ANY(pg_blocking_pids(pid)) AND wait_event = 'advisory')", (pid,),
-                    ).fetchone()[0]:
-                        assert not pending.done(), "model writer bypassed the catalog lock"
-                        assert time.monotonic() < deadline, "model writer never waited for the catalog lock"
-                        time.sleep(0.05)
-                    # Exiting commits the name reservation and releases the lock.
-                response = pending.result(timeout=20)
-                assert response.status_code == 409, (
-                    f"reserved name accepted after catalog commit: {response.status_code} {response.text[:300]}"
+        # A class route's name is refused outright: model aliases never contain ':'.
+        response = session.post(base + "/admin/api/v1/models", json={
+            "type": "standard", "model_name": alias + ":fast", "alias": alias + ":fast",
+            "hosted_on": endpoint,
+        }, timeout=20)
+        assert response.status_code == 400, (
+            f"class route name accepted as a model alias: {response.status_code} {response.text[:300]}"
+        )
+        reserved = alias + "-fast"
+        # Reproduce catalog's transaction/lock protocol on a pooled connection.
+        # The Rust integration test separately exercises the actual reconciler.
+        with ThreadPoolExecutor(max_workers=1) as executor:
+            with psycopg.connect(pooled_dsn) as catalog:
+                catalog.execute("SELECT pg_advisory_xact_lock(%s)", (0x44574D4F44454C50,))
+                pid = catalog.execute("SELECT pg_backend_pid()").fetchone()[0]
+                class_id = catalog.execute(
+                    "INSERT INTO model_serving_classes "
+                    "(deployed_model_id,class_key,display_name,inference_endpoint_id,upstream_model_name) "
+                    "VALUES (%s,'fast','Fast',%s,'pooled-fast-upstream') "
+                    "ON CONFLICT (deployed_model_id,class_key) DO UPDATE SET display_name=EXCLUDED.display_name "
+                    "RETURNING id", (model_id, endpoint),
+                ).fetchone()[0]
+                catalog.execute(
+                    "INSERT INTO model_aliases (alias,deployed_model_id,serving_class_id) VALUES (%s,%s,%s)",
+                    (reserved, model_id, class_id),
                 )
+                pending = executor.submit(session.post, base + "/admin/api/v1/models", json={
+                    "type": "standard", "model_name": reserved, "alias": reserved,
+                    "hosted_on": endpoint,
+                }, timeout=20)
+                deadline = time.monotonic() + 10
+                while not direct.execute(
+                    "SELECT EXISTS (SELECT 1 FROM pg_stat_activity "
+                    "WHERE %s = ANY(pg_blocking_pids(pid)) AND wait_event = 'advisory')", (pid,),
+                ).fetchone()[0]:
+                    assert not pending.done(), "model writer bypassed the catalog lock"
+                    assert time.monotonic() < deadline, "model writer never waited for the catalog lock"
+                    time.sleep(0.05)
+                # Exiting commits the name reservation and releases the lock.
+            response = pending.result(timeout=20)
+            assert response.status_code == 409, (
+                f"reserved name accepted after catalog commit: {response.status_code} {response.text[:300]}"
+            )
     # The following schema-change phase starts its own application instance.
     app.stop(strict=True)
     print("PASS: concurrent pooled catalog/model writes serialize with DISCARD ALL enabled", flush=True)
@@ -179,14 +186,16 @@ def verify_models_schema_change(app, direct):
                 "INSERT INTO model_aliases (alias,deployed_model_id,serving_class_id) VALUES (%s,%s,%s)",
                 (synonym, model["id"], class_id),
             )
-            for reserved in (synonym, alias + ":fast"):
+            # A synonym is a reserved name (409); a class route's name is not a
+            # valid alias at all, since aliases never contain ':' (400).
+            for reserved, status in ((synonym, 409), (alias + ":fast", 400)):
                 response = session.post(
                     base + "/admin/api/v1/models",
                     json={"type": "standard", "model_name": reserved,
                           "alias": reserved, "hosted_on": endpoint},
                     timeout=20,
                 )
-                assert response.status_code == 409, (
+                assert response.status_code == status, (
                     f"reserved class name accepted: {response.status_code} {response.text[:300]}"
                 )
 

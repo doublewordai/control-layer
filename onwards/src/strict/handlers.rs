@@ -1822,6 +1822,7 @@ async fn sanitize_error_response(mut response: Response) -> Response {
             "reason" => "third_party_error",
             "status" => status.as_str().to_string(),
             "model" => labels.model.clone(),
+            "serving_class" => labels.serving_class.clone(),
             "traffic" => labels.traffic,
             "served_by" => labels.served_by.clone(),
         )

@@ -164,6 +164,49 @@ async fn a_model_allowed_param_is_forwarded_only_for_that_model() {
     assert_eq!(count(other, "logprobs", "rejected"), Some(1.0));
 }
 
+#[tokio::test]
+async fn a_class_route_takes_its_models_allowed_params() {
+    let model = "allow-class-model";
+    let route = format!("{model}:fast");
+    LazyLock::force(&METRICS);
+    let mock = MockHttpClient::new(StatusCode::OK, COMPLETION);
+    let targets = Targets::from_config(
+        serde_json::from_value(json!({
+            "strict_mode": true,
+            "targets": {
+                model: {"providers": [{"url": "https://upstream.example.com/v1/"}]},
+                route.as_str(): {"providers": [{"url": "https://upstream.example.com/v1/"}], "class_route_of": model}
+            }
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    let state = AppState::with_client(targets, mock.clone())
+        .with_rejected_params(["logprobs"])
+        .unwrap()
+        .with_model_allowed_params([(model, ["logprobs"])])
+        .unwrap();
+    let server = TestServer::new(build_strict_router(state)).unwrap();
+
+    let response = server
+        .post("/chat/completions")
+        .json(&request(&route, json!({"logprobs": true})))
+        .await;
+    response.assert_status_ok();
+    assert_eq!(mock.get_requests().len(), 1);
+    assert_eq!(
+        count_with(
+            model,
+            &[
+                ("param", "logprobs"),
+                ("action", "allowed"),
+                ("serving_class", "fast")
+            ]
+        ),
+        Some(1.0)
+    );
+}
+
 #[test]
 fn an_unknown_name_in_a_model_allow_list_is_an_error() {
     let error = AppState::with_client(

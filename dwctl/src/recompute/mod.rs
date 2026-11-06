@@ -345,7 +345,17 @@ pub async fn recompute_corpus(
             // module blocks — it reached the cache layer as chat completions).
             let route_has_blocks = !crate::prompt_cache::path_is_plain_completions(&exchange.endpoint);
             let historical = base.with_index(std::sync::Arc::new(cache_replay::HistoricalIndex::new(pool.clone(), row.timestamp)));
-            match cache_replay::reconstruct_split(&historical, model, body, principal, row.timestamp, route_has_blocks).await {
+            match cache_replay::reconstruct_split(
+                &historical,
+                model,
+                row.resolved_serving_class.as_deref(),
+                body,
+                principal,
+                row.timestamp,
+                route_has_blocks,
+            )
+            .await
+            {
                 Ok(Some(split)) => {
                     report_row.reconstructed_cache = Some(report::ReconstructedCache::compare(&split, row));
                 }

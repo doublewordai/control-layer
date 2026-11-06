@@ -62,7 +62,8 @@
 //! | `doubleword.account_name` | account display name, falling back to its username; at most 128 characters |
 //! | `doubleword.api_key_id` | the API key used |
 //! | `doubleword.key_purpose` | the key's purpose (`realtime`, `batch`, ...) |
-//! | `gen_ai.request.model` | the model alias requested |
+//! | `gen_ai.request.model` | the model alias requested (without a class suffix) |
+//! | `doubleword.serving_class` | the class requested: `standard`, or the class a `model:<class>` route names |
 //! | `doubleword.traffic` | `realtime`, or `batch` for requests dispatched by the batch daemon |
 //! | `doubleword.batch.completion_window` | the dispatching batch's completion window (batch traffic only) |
 //! | `doubleword.error.source` | for 4xx/5xx that passed through onwards: `gateway` (decided here: auth, limits, validation) or `provider` (the status is the upstream's) |
@@ -144,6 +145,7 @@ pub const DEFAULT_OTEL_TRACES_FILTER: &str = "info";
 
 use crate::config::LogFormat;
 use crate::inference::rejections::RejectionCode;
+use crate::inference::serving_name::{STANDARD_CLASS, split_served};
 
 /// Longest account name recorded on a span. Display names are free text, and
 /// the name rides on every authenticated request's spans.
@@ -198,12 +200,22 @@ pub fn record_ai_response_attributes<B>(response: &axum::http::Response<B>, span
         if batch && let Some(BatchCompletionWindow(window)) = extensions.get() {
             span.set_attribute("doubleword.batch.completion_window", window.clone());
         }
+        // The identity's model is a configured name, so it splits at its class separator.
+        let (model, class) = identity
+            .model
+            .as_deref()
+            .map(|name| {
+                let (model, class) = split_served(name);
+                (Some(model.to_owned()), Some(class.unwrap_or(STANDARD_CLASS).to_owned()))
+            })
+            .unwrap_or_default();
         let attrs = [
             ("doubleword.account_id", identity.account_id.clone()),
             ("doubleword.account_name", identity.account_name.clone()),
             ("doubleword.api_key_id", identity.api_key_id.map(|id| id.to_string())),
             ("doubleword.key_purpose", identity.key_purpose.clone()),
-            ("gen_ai.request.model", identity.model.clone()),
+            ("gen_ai.request.model", model),
+            ("doubleword.serving_class", class),
         ];
         for (key, value) in attrs {
             if let Some(value) = value {

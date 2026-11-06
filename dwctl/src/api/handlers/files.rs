@@ -13,6 +13,7 @@ use crate::api::models::files::{
 };
 use crate::api::models::users::CurrentUser;
 use crate::auth::permissions::{RequiresPermission, can_read_all_resources, operation, resource};
+use crate::inference::serving_name::has_class_suffix;
 
 use crate::AppState;
 use crate::db::{
@@ -167,19 +168,9 @@ fn validate_endpoint_model_type(url: &str, model: &str, model_type: &ModelType) 
 }
 
 impl OpenAIBatchRequest {
-    /// Transform OpenAI format to internal format
-    ///
-    /// # Arguments
-    /// * `endpoint` - The target endpoint (e.g., "http://localhost:8080/ai")
-    /// * `accessible_models` - Model type and effective reasoning policy by alias
-    fn to_internal(
-        &self,
-        endpoint: &str,
-        accessible_models: &HashMap<String, AccessibleBatchModel>,
-        retired_models: &HashMap<String, String>,
-        allowed_url_paths: &[String],
-        tolerations: &AccountTolerations,
-    ) -> Result<fusillade::RequestTemplateInput> {
+    /// Transform OpenAI format to internal format, validated and routed by the
+    /// upload's context (target endpoint, API key, accessible models and so on).
+    fn to_internal(&self, ctx: &FileRequestContext) -> Result<fusillade::RequestTemplateInput> {
         // Validate custom_id is safe for HTTP headers
         validate_custom_id(&self.custom_id)?;
 
@@ -187,7 +178,7 @@ impl OpenAIBatchRequest {
         let _validated_method = self.method.parse::<AllowedHttpMethod>()?;
 
         // Validate URL path
-        validate_url_path(&self.url, allowed_url_paths)?;
+        validate_url_path(&self.url, &ctx.allowed_url_paths)?;
 
         // Extract model from body if present
         let model = self
@@ -199,21 +190,27 @@ impl OpenAIBatchRequest {
             })?
             .to_string();
 
-        // Batches use deadline scheduling, so a model suffix is ignored.
-        // Resolve the base model before validating access.
-        let (model, _) = crate::inference::model_selector::split_model_suffix(&model).map_err(|error| Error::BadRequest {
-            message: error.to_string(),
-        })?;
-        let model = model.to_string();
+        // Batch work always runs on the model's standard class, and model
+        // aliases never contain ':', so any suffix is refused.
+        if has_class_suffix(&model) {
+            let message = match ctx.class_routes.get(&model) {
+                Some(standard) => format!("Model '{model}' is available for realtime requests only; use '{standard}' in batch files."),
+                None => format!("Model '{model}' has not been configured or is not available to user."),
+            };
+            return Err(Error::BadRequest { message });
+        }
 
         // Validate model access
-        let accessible_model = accessible_models.get(&model).ok_or_else(|| match retired_models.get(&model) {
-            Some(message) => Error::Gone { message: message.clone() },
-            None => Error::ModelAccessDenied {
-                model_name: model.clone(),
-                message: format!("Model '{}' has not been configured or is not available to user.", model),
-            },
-        })?;
+        let accessible_model = ctx
+            .accessible_models
+            .get(&model)
+            .ok_or_else(|| match ctx.retired_models.get(&model) {
+                Some(message) => Error::Gone { message: message.clone() },
+                None => Error::ModelAccessDenied {
+                    model_name: model.clone(),
+                    message: format!("Model '{}' has not been configured or is not available to user.", model),
+                },
+            })?;
 
         // Validate endpoint matches model type (skip if model type is unknown)
         if let Some(model_type) = &accessible_model.model_type {
@@ -243,7 +240,7 @@ impl OpenAIBatchRequest {
         // toleration list for this line's model, exactly as its realtime and
         // flex requests do. Applied after the strip above so the client can
         // never override it.
-        if let Some(tolerations) = tolerations.for_model(&model) {
+        if let Some(tolerations) = ctx.tolerations.for_model(&model) {
             crate::inference::middleware::set_routing_tolerations(&mut sanitized_body, &tolerations);
         }
 
@@ -254,7 +251,7 @@ impl OpenAIBatchRequest {
 
         Ok(fusillade::RequestTemplateInput {
             custom_id: Some(self.custom_id.clone()),
-            endpoint: endpoint.to_string(),
+            endpoint: ctx.endpoint.clone(),
             method: self.method.clone(),
             path: self.url.clone(),
             body,
@@ -835,6 +832,9 @@ struct FileRequestContext {
     accessible_models: HashMap<String, AccessibleBatchModel>,
     retired_models: HashMap<String, String>,
     allowed_url_paths: Vec<String>,
+    /// Class routes (`alias:<class>`) of class-routed models, refused in
+    /// batch lines.
+    class_routes: HashMap<String, String>,
     /// The toleration presets of the account that owns this upload, resolved
     /// per line by its model. A pinned line's list is written verbatim to
     /// `nvext.routing_constraints.tolerations` on its template body.
@@ -877,13 +877,6 @@ fn create_file_stream(
     req_ctx: FileRequestContext,
     api_key_id: Option<uuid::Uuid>,
 ) -> FileStreamResult {
-    let FileRequestContext {
-        endpoint,
-        accessible_models,
-        retired_models,
-        allowed_url_paths,
-        tolerations,
-    } = req_ctx;
     let normalizer = config.normalizer.clone();
     let normalizer_mode = config.normalizer_mode;
     let expiry_seconds = config.expiry_seconds.clone();
@@ -1097,13 +1090,7 @@ fn create_file_stream(
                                     match serde_json::from_str::<OpenAIBatchRequest>(trimmed) {
                                         Ok(openai_req) => {
                                             // Transform to internal format (includes model access validation)
-                                            match openai_req.to_internal(
-                                                &endpoint,
-                                                &accessible_models,
-                                                &retired_models,
-                                                &allowed_url_paths,
-                                                &tolerations,
-                                            ) {
+                                            match openai_req.to_internal(&req_ctx) {
                                                 Ok(mut template) => {
                                                     // Normalise image URLs in the per-template body
                                                     // before the size cap check, since substitution
@@ -1200,13 +1187,7 @@ fn create_file_stream(
 
                             match serde_json::from_str::<OpenAIBatchRequest>(trimmed) {
                                 Ok(openai_req) => {
-                                    match openai_req.to_internal(
-                                        &endpoint,
-                                        &accessible_models,
-                                        &retired_models,
-                                        &allowed_url_paths,
-                                        &tolerations,
-                                    ) {
+                                    match openai_req.to_internal(&req_ctx) {
                                         Ok(mut template) => {
                                             // Normalise image URLs in the trailing line as well.
                                             if let Err(e) = normalize_template_body_in_place(
@@ -1501,6 +1482,20 @@ pub async fn upload_file<P: PoolProvider>(
             retired_models,
             allowed_url_paths: config.batches.allowed_url_paths.clone(),
             tolerations,
+            class_routes: state
+                .onwards_targets
+                .as_ref()
+                .map(|targets| {
+                    targets
+                        .targets
+                        .iter()
+                        .filter_map(|entry| {
+                            let model = entry.value().default_pool().class_route_of()?.to_owned();
+                            Some((entry.key().clone(), model))
+                        })
+                        .collect()
+                })
+                .unwrap_or_default(),
         },
         Some(api_key_id),
     );

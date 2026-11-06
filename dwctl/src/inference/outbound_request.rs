@@ -54,6 +54,8 @@ use futures::StreamExt;
 use serde_json::Value;
 use tracing::{debug, warn};
 
+use super::serving_name::ServingName;
+
 /// The three stream-shaped timeouts, mirroring the daemon's configuration.
 ///
 /// Three rather than two: the idle check between events is what catches a stream
@@ -193,21 +195,24 @@ pub async fn outbound_request_middleware(State(cfg): State<OutboundConfig>, requ
 }
 
 /// The per-token prices the request is charged at, from the key's account and
-/// purpose, the model it names, the batch headers billing reads, and how the
-/// cache layer reports its cache reads. `None` for a key not in the policy map.
-fn unit_prices(cfg: &OutboundConfig, parts: &axum::http::request::Parts, model: &str) -> Option<crate::pricing::UnitPrices> {
+/// purpose, the model and class it names, the batch headers billing reads, and
+/// how the cache layer reports its cache reads. `None` for a key not in the
+/// policy map.
+fn unit_prices(cfg: &OutboundConfig, parts: &axum::http::request::Parts, requested: &str) -> Option<crate::pricing::UnitPrices> {
     let value = |name: &str| parts.headers.get(name).and_then(|v| v.to_str().ok()).filter(|v| !v.is_empty());
     let bearer = value(header::AUTHORIZATION.as_str()).and_then(|v| v.strip_prefix("Bearer "));
     let key = crate::auth::internal_credential::presented_key_hash(&parts.extensions, bearer)?;
     let completion_window = value("x-fusillade-batch-completion-window");
     let batch_created_at = value("x-fusillade-batch-created-at").and_then(|v| v.parse::<chrono::DateTime<chrono::Utc>>().ok());
     let cache_reads = parts.extensions.get::<crate::prompt_cache::CacheReadSource>().copied();
+    // A class route is billed as its model in that class.
+    let name = ServingName::of(&parts.extensions, requested);
     let query = crate::pricing::PriceQuery {
-        model,
+        model: &name.model,
         completion_window,
         batch_created_at,
         now: chrono::Utc::now(),
-        serving_class: onwards::serving::ServingClass::Standard.as_str(),
+        serving_class: name.class_label(),
         cache_reads,
     };
     cfg.key_policy.unit_prices(&key, &query)

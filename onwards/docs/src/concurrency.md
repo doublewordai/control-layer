@@ -98,10 +98,10 @@ process by default; `AppState::with_inflight_limiter` plugs in a shared
 counter so several instances enforce one limit.
 
 Every request checked against the limit is counted in
-`onwards_inflight_limit_checks_total{model, account, account_name}` and every
-refusal in `onwards_inflight_limit_refusals_total{model, account, account_name}`,
+`onwards_inflight_limit_checks_total{model, serving_class, account, account_name}` and every
+refusal in `onwards_inflight_limit_refusals_total{model, serving_class, account, account_name}`,
 so the share of an account's realtime requests refused on an alias is the ratio
-of the two. `onwards_inflight_account_limit{model, account, account_name}` holds
+of the two. `onwards_inflight_account_limit{model, serving_class, account, account_name}` holds
 the limit the account was last checked against: its own from
 `account_inflight_limits`, or the alias's `inflight_limit`. `account_name` is the
 key's `account_name` label, empty when the key has none, so a dashboard can show

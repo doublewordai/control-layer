@@ -61,14 +61,6 @@ impl ModelProvisioning<'_> {
             .fetch_all(&mut *self.db)
             .await?;
         let managed: HashSet<&str> = catalog.models.iter().map(|m| m.clay.alias.as_str()).collect();
-        // Activation is intentionally unsupported until every runtime reader/writer
-        // understands class routing. In particular, never overwrite an active route.
-        for (_, alias, mode) in &models {
-            ensure!(
-                !managed.contains(alias.as_str()) || mode == "legacy",
-                "model {alias:?} uses class_routes; this catalog writer cannot edit activated models yet"
-            );
-        }
         let managed_ids: HashSet<Uuid> = models
             .iter()
             .filter(|(_, a, _)| managed.contains(a.as_str()))
@@ -108,38 +100,6 @@ impl ModelProvisioning<'_> {
                 );
             }
         }
-        let stored: Vec<(String, Uuid, String)> = sqlx::query_as(
-            "SELECT a.alias,a.deployed_model_id,c.class_key FROM model_aliases a JOIN model_serving_classes c ON c.id=a.serving_class_id",
-        )
-        .fetch_all(&mut *self.db)
-        .await?;
-        let mut synonyms = HashSet::new();
-        for (alias, model, _) in &stored {
-            if !managed_ids.contains(model) {
-                ensure!(
-                    !primary.contains(&alias.to_lowercase()),
-                    "primary name conflicts with existing synonym {alias:?}"
-                );
-                synonyms.insert(alias.to_lowercase());
-            }
-        }
-        for m in &catalog.models {
-            let id = models.iter().find(|(_, a, _)| a == &m.clay.alias).map(|(id, _, _)| *id);
-            for (key, class) in &m.clay.class_routes {
-                for alias in &class.aliases {
-                    ensure!(
-                        !primary.contains(&alias.to_lowercase()) && synonyms.insert(alias.to_lowercase()),
-                        "synonym {alias:?} conflicts with an existing model/name"
-                    );
-                    if let Some((_, owner, old_class)) = stored.iter().find(|(a, _, _)| a.eq_ignore_ascii_case(alias)) {
-                        ensure!(
-                            Some(*owner) == id && old_class == key,
-                            "synonym {alias:?} cannot be rebound to another model/class; retire it explicitly first"
-                        );
-                    }
-                }
-            }
-        }
         Ok(())
     }
 
@@ -150,15 +110,10 @@ impl ModelProvisioning<'_> {
         endpoints: &HashMap<String, Uuid>,
         at: DateTime<Utc>,
     ) -> Result<()> {
-        let aliases: Vec<&str> = model
-            .clay
-            .class_routes
-            .values()
-            .flat_map(|c| c.aliases.iter().map(String::as_str))
-            .collect();
-        sqlx::query("DELETE FROM model_aliases WHERE deployed_model_id=$1 AND NOT (alias=ANY($2))")
+        // Class synonyms are retired: a class is reached only as `alias` or
+        // `alias:<class>`.
+        sqlx::query("DELETE FROM model_aliases WHERE deployed_model_id=$1")
             .bind(model_id)
-            .bind(&aliases)
             .execute(&mut *self.db)
             .await?;
         let old: Vec<String> = sqlx::query_scalar("SELECT class_key FROM model_serving_classes WHERE deployed_model_id=$1")
@@ -176,28 +131,15 @@ impl ModelProvisioning<'_> {
         }
         for (key, class) in &model.clay.class_routes {
             // The explicit no-op condition avoids notification/timestamp churn on restart.
-            sqlx::query("INSERT INTO model_serving_classes (deployed_model_id,class_key,display_name,inference_endpoint_id,upstream_model_name)
-                VALUES ($1,$2,$3,$4,$5) ON CONFLICT (deployed_model_id,class_key) DO UPDATE SET
-                    display_name=EXCLUDED.display_name,inference_endpoint_id=EXCLUDED.inference_endpoint_id,upstream_model_name=EXCLUDED.upstream_model_name
-                WHERE ROW(model_serving_classes.display_name,model_serving_classes.inference_endpoint_id,model_serving_classes.upstream_model_name)
-                   IS DISTINCT FROM ROW(EXCLUDED.display_name,EXCLUDED.inference_endpoint_id,EXCLUDED.upstream_model_name)")
+            sqlx::query("INSERT INTO model_serving_classes (deployed_model_id,class_key,display_name,inference_endpoint_id,upstream_model_name,realtime_inflight_limit)
+                VALUES ($1,$2,$3,$4,$5,$6) ON CONFLICT (deployed_model_id,class_key) DO UPDATE SET
+                    display_name=EXCLUDED.display_name,inference_endpoint_id=EXCLUDED.inference_endpoint_id,upstream_model_name=EXCLUDED.upstream_model_name,
+                    realtime_inflight_limit=EXCLUDED.realtime_inflight_limit
+                WHERE ROW(model_serving_classes.display_name,model_serving_classes.inference_endpoint_id,model_serving_classes.upstream_model_name,model_serving_classes.realtime_inflight_limit)
+                   IS DISTINCT FROM ROW(EXCLUDED.display_name,EXCLUDED.inference_endpoint_id,EXCLUDED.upstream_model_name,EXCLUDED.realtime_inflight_limit)")
                 .bind(model_id).bind(key).bind(&class.display_name).bind(endpoints[&class.endpoint]).bind(&class.upstream_model_name)
+                .bind(class.realtime_inflight_limit)
                 .execute(&mut *self.db).await?;
-            let id: Uuid = sqlx::query_scalar("SELECT id FROM model_serving_classes WHERE deployed_model_id=$1 AND class_key=$2")
-                .bind(model_id)
-                .bind(key)
-                .fetch_one(&mut *self.db)
-                .await?;
-            for alias in &class.aliases {
-                sqlx::query(
-                    "INSERT INTO model_aliases (alias,deployed_model_id,serving_class_id) VALUES ($1,$2,$3) ON CONFLICT (alias) DO NOTHING",
-                )
-                .bind(alias)
-                .bind(model_id)
-                .bind(id)
-                .execute(&mut *self.db)
-                .await?;
-            }
             self.reconcile_tariffs(model_id, None, Some(key), &class.tariffs, at).await?;
             self.reconcile_cache_tariff(
                 model_id,
@@ -208,6 +150,12 @@ impl ModelProvisioning<'_> {
             )
             .await?;
         }
+        // Activation follows the classes it routes to, in the same transaction.
+        sqlx::query("UPDATE deployed_models SET routing_mode = $2 WHERE id = $1 AND routing_mode IS DISTINCT FROM $2")
+            .bind(model_id)
+            .bind(model.clay.routing_mode.as_str())
+            .execute(&mut *self.db)
+            .await?;
         Ok(())
     }
 }

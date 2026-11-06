@@ -106,6 +106,8 @@ pub struct ProviderPool {
     /// The alias's global batch in-flight cap, shared across every daemon pod
     /// and control-layer replica. `None` means batch is uncapped on this alias.
     batch_inflight: Option<u32>,
+    /// The model this alias is a serving-class route of, when it is one.
+    class_route_of: Option<String>,
 }
 
 /// The serving policy declared on an alias: its per-account overlays. Behind
@@ -183,6 +185,7 @@ impl ProviderPool {
             serving: AliasServing::default(),
             inflight: None,
             batch_inflight: None,
+            class_route_of: None,
         }
     }
 
@@ -219,6 +222,7 @@ impl ProviderPool {
             serving: AliasServing::default(),
             inflight: None,
             batch_inflight: None,
+            class_route_of: None,
         }
     }
 
@@ -244,6 +248,16 @@ impl ProviderPool {
 
     pub fn batch_inflight_limit(&self) -> Option<u32> {
         self.batch_inflight
+    }
+
+    pub fn with_class_route_of(mut self, model: Option<String>) -> Self {
+        self.class_route_of = model;
+        self
+    }
+
+    /// The model this alias is a serving-class route of, when it is one.
+    pub fn class_route_of(&self) -> Option<&str> {
+        self.class_route_of.as_deref()
     }
 
     /// Per-account overrides on this alias, keyed by account id.

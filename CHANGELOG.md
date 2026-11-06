@@ -1,5 +1,19 @@
 # Changelog
 
+## [16.6.0](https://github.com/doublewordai/control-layer/compare/v16.5.0...v16.6.0) (2026-11-06)
+
+
+### Features
+
+* route serving classes to their own upstreams ([#2100](https://github.com/doublewordai/control-layer/issues/2100)) ([7e40b8f](https://github.com/doublewordai/control-layer/commit/7e40b8f49cddd6cce04e9b4a077c993bda0ceb43))
+
+## [16.5.0](https://github.com/doublewordai/control-layer/compare/v16.4.0...v16.5.0) (2026-11-06)
+
+
+### Features
+
+* **api-keys:** stop storing API key plaintext (DW-1012) ([#2172](https://github.com/doublewordai/control-layer/issues/2172)) ([dde6a1c](https://github.com/doublewordai/control-layer/commit/dde6a1cd608a96bb917a1007e15299e6e295cff8))
+
 ## [16.4.0](https://github.com/doublewordai/control-layer/compare/v16.3.0...v16.4.0) (2026-11-05)
 
 
