@@ -1,0 +1,50 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n            WITH live AS MATERIALIZED (\n                SELECT prefix_hash, cumulative_bytes, tokens_per_byte, exact_tokens, visible_at, expires_at\n                FROM reference_cache_entries\n                WHERE principal_id = $1 AND virtual_model = $2\n                  AND prefix_hash = ANY($3) AND expires_at > $5\n            ), to_refresh AS MATERIALIZED (\n                SELECT e.prefix_hash\n                FROM reference_cache_entries e\n                JOIN live ON live.prefix_hash = e.prefix_hash\n                WHERE e.principal_id = $1 AND e.virtual_model = $2\n                  AND live.visible_at <= $5\n                  AND e.expires_at < now() + make_interval(secs => $4::float8 * 0.9)\n                ORDER BY e.prefix_hash\n                FOR UPDATE OF e\n            ), refreshed AS (\n                UPDATE reference_cache_entries e\n                SET expires_at = now() + make_interval(secs => $4::float8)\n                FROM to_refresh\n                WHERE e.principal_id = $1 AND e.virtual_model = $2 AND e.prefix_hash = to_refresh.prefix_hash\n                RETURNING e.prefix_hash\n            )\n            SELECT\n                prefix_hash AS \"prefix_hash!\",\n                cumulative_bytes AS \"cumulative_bytes!\",\n                tokens_per_byte,\n                exact_tokens,\n                visible_at AS \"visible_at!\"\n            FROM live\n            ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "prefix_hash!",
+        "type_info": "Bytea"
+      },
+      {
+        "ordinal": 1,
+        "name": "cumulative_bytes!",
+        "type_info": "Int8"
+      },
+      {
+        "ordinal": 2,
+        "name": "tokens_per_byte",
+        "type_info": "Float4"
+      },
+      {
+        "ordinal": 3,
+        "name": "exact_tokens",
+        "type_info": "Int4"
+      },
+      {
+        "ordinal": 4,
+        "name": "visible_at!",
+        "type_info": "Timestamptz"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Text",
+        "ByteaArray",
+        "Float8",
+        "Timestamptz"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      true,
+      true,
+      false
+    ]
+  },
+  "hash": "c1d4c02f5b507fd138bac35bee6fca9f7f41d6d2e529b2705c1806926bcbf393"
+}

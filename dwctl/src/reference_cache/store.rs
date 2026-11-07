@@ -1,22 +1,32 @@
 //! Postgres store for the reference cache: `reference_cache_entries`, keyed by
 //! `(principal_id, virtual_model, prefix_hash)`.
 //!
-//! Three statements, each a single round trip whatever the prompt length:
+//! Three bounded operations:
 //! [`ReferenceStore::lookup`] reads every live boundary of a request and slides the
 //! expiry of the ones it found; [`ReferenceStore::upsert`] makes a request's boundaries
 //! visible; [`ReferenceStore::sweep_expired`] deletes expired rows in bounded batches.
 //!
-//! The store shares the application's pool, so it holds at most `max_connections` of
-//! its connections at once: however many requests are in flight, the shadow estimate
-//! cannot starve the analytics outbox or anything else on that pool.
+//! Optional cache work uses a separate bounded pool with server-side deadlines. Its
+//! connection budget remains enforced even when callers abandon their query futures.
 
-use std::sync::Arc;
 use std::time::Duration;
 
 use chrono::{DateTime, Utc};
-use tokio::sync::{Semaphore, SemaphorePermit};
+use sqlx_pool_router::PoolProvider;
 
+use super::pools::CachePools;
 use crate::types::UserId;
+
+/// This is optional shadow telemetry. Do not send unbounded arrays to PostgreSQL for
+/// unusually long conversations; leave their estimate unavailable instead.
+const MAX_PREFIXES_PER_OPERATION: usize = 1_024;
+
+fn check_prefix_count(count: usize) -> Result<(), sqlx::Error> {
+    if count > MAX_PREFIXES_PER_OPERATION {
+        return Err(sqlx::Error::Protocol("reference-cache prefix budget exceeded".into()));
+    }
+    Ok(())
+}
 
 /// One live boundary returned by [`ReferenceStore::lookup`].
 #[derive(Debug, Clone, PartialEq)]
@@ -46,23 +56,20 @@ pub struct EntryWrite<'a> {
 pub struct ReferenceStore {
     /// Live provider (not a pinned pool): survives runtime pool swaps. Always the
     /// primary: the table is unlogged, so a replica has no rows.
-    pool: sqlx_pool_router::DynPools,
+    pool: CachePools,
     ttl: Duration,
-    /// One permit per pool connection this store may hold.
-    connections: Arc<Semaphore>,
 }
 
 impl ReferenceStore {
-    pub fn new(pool: impl sqlx_pool_router::PoolProvider, ttl: Duration, max_connections: usize) -> Self {
+    pub fn new(pool: impl PoolProvider, ttl: Duration, max_connections: usize) -> Self {
         Self {
-            pool: sqlx_pool_router::DynPools::new(pool),
+            pool: CachePools::new(pool, max_connections),
             ttl,
-            connections: Arc::new(Semaphore::new(max_connections.max(1))),
         }
     }
 
-    async fn connection_permit(&self) -> SemaphorePermit<'_> {
-        self.connections.acquire().await.expect("the semaphore is never closed")
+    pub(super) fn pools(&self) -> CachePools {
+        self.pool.clone()
     }
 
     /// Every entry among `prefix_hashes` that was live when the request arrived, and slide
@@ -88,24 +95,33 @@ impl ReferenceStore {
         if prefix_hashes.is_empty() {
             return Ok(Vec::new());
         }
-        let _permit = self.connection_permit().await;
-        // The UPDATE runs even though the final SELECT does not reference it: Postgres
-        // always executes data-modifying CTEs.
-        sqlx::query_as!(
+        check_prefix_count(prefix_hashes.len())?;
+        let mut tx = self.pool.begin().await?;
+        // Lock only rows needing refresh, in the same prefix order as upsert. Merely
+        // sorting UPDATE's input does not guarantee its lock order: pre-lock explicitly.
+        // Postgres executes the modifying CTE even though SELECT does not reference it.
+        let live = sqlx::query_as!(
             LiveEntry,
             r#"
-            WITH live AS (
+            WITH live AS MATERIALIZED (
                 SELECT prefix_hash, cumulative_bytes, tokens_per_byte, exact_tokens, visible_at, expires_at
                 FROM reference_cache_entries
                 WHERE principal_id = $1 AND virtual_model = $2
                   AND prefix_hash = ANY($3) AND expires_at > $5
+            ), to_refresh AS MATERIALIZED (
+                SELECT e.prefix_hash
+                FROM reference_cache_entries e
+                JOIN live ON live.prefix_hash = e.prefix_hash
+                WHERE e.principal_id = $1 AND e.virtual_model = $2
+                  AND live.visible_at <= $5
+                  AND e.expires_at < now() + make_interval(secs => $4::float8 * 0.9)
+                ORDER BY e.prefix_hash
+                FOR UPDATE OF e
             ), refreshed AS (
                 UPDATE reference_cache_entries e
                 SET expires_at = now() + make_interval(secs => $4::float8)
-                FROM live
-                WHERE e.principal_id = $1 AND e.virtual_model = $2 AND e.prefix_hash = live.prefix_hash
-                  AND live.visible_at <= $5
-                  AND live.expires_at < now() + make_interval(secs => $4::float8 * 0.9)
+                FROM to_refresh
+                WHERE e.principal_id = $1 AND e.virtual_model = $2 AND e.prefix_hash = to_refresh.prefix_hash
                 RETURNING e.prefix_hash
             )
             SELECT
@@ -122,8 +138,10 @@ impl ReferenceStore {
             self.ttl.as_secs_f64(),
             arrival,
         )
-        .fetch_all(&self.pool)
-        .await
+        .fetch_all(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        Ok(live)
     }
 
     /// Make boundaries visible. Returns the rows inserted or updated.
@@ -137,10 +155,17 @@ impl ReferenceStore {
         if write.prefix_hashes.is_empty() {
             return Ok(0);
         }
-        let _permit = self.connection_permit().await;
+        check_prefix_count(write.prefix_hashes.len())?;
+        if write.cumulative_bytes.len() != write.prefix_hashes.len() || write.exact_tokens.len() != write.prefix_hashes.len() {
+            return Err(sqlx::Error::Protocol(
+                "reference-cache boundary arrays must have equal lengths".into(),
+            ));
+        }
+        let mut tx = self.pool.begin().await?;
         // The NOT EXISTS filter keeps rows that need nothing out of ON CONFLICT, which
         // would otherwise lock each of them. A row that turns live between the filter and
-        // the insert just takes the CASE branches below.
+        // the insert just takes the CASE branches below. Sort the INSERT input so
+        // overlapping batches cannot acquire conflicting row locks in opposite orders.
         let result = sqlx::query!(
             r#"
             INSERT INTO reference_cache_entries AS e
@@ -156,6 +181,7 @@ impl ReferenceStore {
                   AND (x.tokens_per_byte IS NOT NULL OR $6::real IS NULL)
                   AND (x.exact_tokens IS NOT NULL OR b.exact_tokens IS NULL)
             )
+            ORDER BY b.prefix_hash
             ON CONFLICT (principal_id, virtual_model, prefix_hash) DO UPDATE SET
                 cumulative_bytes = EXCLUDED.cumulative_bytes,
                 tokens_per_byte = CASE WHEN e.expires_at <= now() THEN EXCLUDED.tokens_per_byte
@@ -174,8 +200,9 @@ impl ReferenceStore {
             write.tokens_per_byte,
             self.ttl.as_secs_f64(),
         )
-        .execute(&self.pool)
+        .execute(&mut *tx)
         .await?;
+        tx.commit().await?;
         Ok(result.rows_affected())
     }
 
@@ -184,13 +211,14 @@ impl ReferenceStore {
     /// [`Self::lookup`]). `SKIP LOCKED` keeps the sweep off rows a request is writing at
     /// that moment.
     pub async fn sweep_expired(&self, batch_size: i64, grace: Duration) -> Result<u64, sqlx::Error> {
-        let _permit = self.connection_permit().await;
+        let mut tx = self.pool.begin().await?;
         let result = sqlx::query!(
             r#"
             WITH victims AS (
                 SELECT principal_id, virtual_model, prefix_hash
                 FROM reference_cache_entries
                 WHERE expires_at <= now() - make_interval(secs => $2::float8)
+                ORDER BY principal_id, virtual_model, prefix_hash
                 LIMIT $1
                 FOR UPDATE SKIP LOCKED
             )
@@ -202,8 +230,9 @@ impl ReferenceStore {
             batch_size,
             grace.as_secs_f64(),
         )
-        .execute(&self.pool)
+        .execute(&mut *tx)
         .await?;
+        tx.commit().await?;
         Ok(result.rows_affected())
     }
 }
@@ -214,6 +243,96 @@ mod tests {
 
     fn hashes(names: &[&str]) -> Vec<Vec<u8>> {
         names.iter().map(|n| n.as_bytes().to_vec()).collect()
+    }
+
+    #[dwctl_test_macros::test]
+    async fn oversized_prefix_batches_do_not_open_a_cache_connection(pool: sqlx::PgPool) {
+        let store = ReferenceStore::new(pool, Duration::from_secs(300), 1);
+        let principal = uuid::Uuid::new_v4();
+        let hs = vec![vec![0]; MAX_PREFIXES_PER_OPERATION + 1];
+        let bytes = vec![1; hs.len()];
+        let exact = vec![None; hs.len()];
+        assert!(store.upsert(&write(principal, &hs, &bytes, &exact, None)).await.is_err());
+        assert!(store.lookup(principal, "model-a", &hs, Utc::now()).await.is_err());
+        // UNNEST pads short arrays to the longest array's length. Check every input
+        // length so a malformed write cannot bypass the prefix budget that way.
+        assert!(store.upsert(&write(principal, &hs[..1], &bytes, &exact, None)).await.is_err());
+        assert_eq!(store.pool.write().size(), 0);
+        store.pool.write().close().await;
+    }
+
+    #[dwctl_test_macros::test]
+    async fn opposing_upserts_and_refreshes_lock_prefixes_in_the_same_order(pool: sqlx::PgPool) {
+        let store = ReferenceStore::new(pool.clone(), Duration::from_secs(300), 2);
+        // Make conflicting operations overlap after taking their first row lock. With
+        // the old UNNEST order and unordered UPDATE this produces an a->b / b->a cycle.
+        sqlx::raw_sql(
+            "CREATE FUNCTION slow_reference_update() RETURNS trigger LANGUAGE plpgsql AS $$ \
+             BEGIN PERFORM pg_sleep(0.03); RETURN NEW; END $$; \
+             CREATE TRIGGER slow_reference_update BEFORE UPDATE ON reference_cache_entries \
+             FOR EACH ROW EXECUTE FUNCTION slow_reference_update();",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        let forward = hashes(&["a", "b"]);
+        let reverse = hashes(&["b", "a"]);
+        // Warm both connections so connection setup cannot serialize the operations.
+        let one = store.pool.write().acquire().await.unwrap();
+        let two = store.pool.write().acquire().await.unwrap();
+        drop((one, two));
+        for _ in 0..4 {
+            let principal = uuid::Uuid::new_v4();
+            store
+                .upsert(&write(principal, &forward, &[10, 20], &[None, None], None))
+                .await
+                .unwrap();
+            sqlx::query("UPDATE reference_cache_entries SET expires_at = now() + interval '10 seconds' WHERE principal_id = $1")
+                .bind(principal)
+                .execute(&pool)
+                .await
+                .unwrap();
+            let input = write(principal, &reverse, &[20, 10], &[Some(20), Some(10)], Some(1.0));
+            let (upsert, lookup) = tokio::join!(store.upsert(&input), store.lookup(principal, "model-a", &forward, Utc::now()),);
+            upsert.expect("opposing input order must not deadlock the upsert");
+            assert_eq!(lookup.expect("expiry refresh must use the same lock order").len(), 2);
+            let live = store.lookup(principal, "model-a", &forward, Utc::now()).await.unwrap();
+            assert!(
+                live.iter()
+                    .all(|entry| entry.tokens_per_byte == Some(1.0) && entry.exact_tokens.is_some())
+            );
+        }
+        store.pool.write().close().await;
+    }
+
+    #[dwctl_test_macros::test]
+    async fn lock_deadline_skips_cache_work_without_changing_main_session_settings(pool: sqlx::PgPool) {
+        let store = ReferenceStore::new(pool.clone(), Duration::from_secs(300), 1);
+        let principal = uuid::Uuid::new_v4();
+        let hs = hashes(&["a"]);
+        store.upsert(&write(principal, &hs, &[10], &[None], None)).await.unwrap();
+        let mut blocker = pool.begin().await.unwrap();
+        sqlx::query("SELECT 1 FROM reference_cache_entries WHERE principal_id = $1 FOR UPDATE")
+            .bind(principal)
+            .execute(&mut *blocker)
+            .await
+            .unwrap();
+        let error = tokio::time::timeout(
+            Duration::from_secs(2),
+            store.upsert(&write(principal, &hs, &[10], &[Some(10)], Some(1.0))),
+        )
+        .await
+        .expect("the server lock deadline must stop waiting")
+        .unwrap_err();
+        assert_eq!(error.as_database_error().unwrap().code().as_deref(), Some("55P03"));
+        let main_lock_timeout: String = sqlx::query_scalar("SHOW lock_timeout").fetch_one(&mut *blocker).await.unwrap();
+        assert_eq!(
+            main_lock_timeout, "0",
+            "cache session settings must not leak into the application pool"
+        );
+        blocker.rollback().await.unwrap();
+        store.upsert(&write(principal, &hs, &[10], &[Some(10)], Some(1.0))).await.unwrap();
+        store.pool.write().close().await;
     }
 
     fn write<'a>(
