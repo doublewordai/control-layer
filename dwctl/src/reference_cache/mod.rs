@@ -42,10 +42,13 @@
 //! analytics handler after the response, bounded by `estimate_timeout_ms`, before the
 //! record goes to the outbox; the completion write is spawned from there. Any failure
 //! records NULL and increments `dwctl_reference_cache_estimates_total{outcome}`. The store
-//! holds at most `max_connections` pool connections, so a slow or stuck reference table
-//! cannot take the connections the outbox needs to publish the record.
+//! uses a dedicated pool of at most `max_connections` connections (including principal
+//! resolution), with server-side statement and lock deadlines. Caller cancellation
+//! cannot borrow additional main-pool connections. This bounds connection starvation;
+//! database CPU and storage remain shared resources.
 
 pub mod layer;
+mod pools;
 pub mod store;
 
 use std::collections::{HashMap, HashSet};
@@ -106,9 +109,9 @@ pub struct ReferenceCacheConfig {
     pub estimate_timeout_ms: u64,
     /// How often each replica deletes expired entries.
     pub sweep_interval_secs: u64,
-    /// Connections of the application pool the estimate may hold at once (lookups and
-    /// writes together; the sweeper takes one more). Work beyond it waits within the
-    /// estimate timeout or is skipped, so the shadow estimate cannot starve the pool.
+    /// Dedicated connections per replica, shared by principal resolution, lookups and
+    /// writes; the sweeper has one more. Acquisition waits at most 500ms, statements
+    /// run at most 1s and lock waits at most 250ms, independently of caller timeouts.
     pub max_connections: u32,
 }
 
@@ -310,6 +313,7 @@ impl Unavailable {
             Self::NoUsage => "no_usage",
             Self::NoBody => "no_body",
             Self::Parse(_) => "parse_error",
+            Self::Backend(sqlx::Error::PoolTimedOut) => "backpressure",
             Self::Backend(_) => "backend_error",
             Self::Principal => "principal_error",
         }
@@ -339,9 +343,11 @@ impl std::fmt::Debug for ReferenceCache {
 
 impl ReferenceCache {
     pub fn new(config: &ReferenceCacheConfig, pool: impl sqlx_pool_router::PoolProvider, telemetry: TelemetryPolicy) -> Self {
+        let store = ReferenceStore::new(pool, config.ttl(), config.max_connections as usize);
+        let principal = PrincipalResolver::new(store.pools()).with_query_timeout(Duration::from_secs(1));
         Self {
-            store: ReferenceStore::new(pool.clone(), config.ttl(), config.max_connections as usize),
-            principal: PrincipalResolver::new(pool),
+            store,
+            principal,
             orgs: config.orgs.iter().copied().collect(),
             models: ModelFilter::from_config(&config.models),
             template_allowance: config.template_allowance_tokens.clone(),
@@ -424,6 +430,7 @@ impl ReferenceCache {
         };
         match tokio::time::timeout(self.estimate_timeout, self.store.upsert(&write)).await {
             Ok(Ok(_)) => write_outcome("first_token", "ok"),
+            Ok(Err(sqlx::Error::PoolTimedOut)) => write_outcome("first_token", "backpressure"),
             Ok(Err(e)) => {
                 crate::background_error!(REFERENCE_CACHE, "first_token_write", Warning, error = %e, "reference cache: first-token write failed");
                 write_outcome("first_token", "error");
@@ -474,7 +481,9 @@ impl ReferenceCache {
             }
             Ok(Ok(None)) => None,
             Ok(Err(e)) => {
-                if let Unavailable::Backend(err) = &e {
+                if let Unavailable::Backend(err) = &e
+                    && !matches!(err, sqlx::Error::PoolTimedOut)
+                {
                     crate::background_error!(REFERENCE_CACHE, "lookup", Warning, error = %err, "reference cache: lookup failed; estimate recorded as NULL");
                 }
                 if let Unavailable::Parse(kind) = &e {
@@ -526,6 +535,7 @@ impl ReferenceCache {
             };
             match tokio::time::timeout(timeout, store.upsert(&write)).await {
                 Ok(Ok(_)) => write_outcome("completion", "ok"),
+                Ok(Err(sqlx::Error::PoolTimedOut)) => write_outcome("completion", "backpressure"),
                 Ok(Err(e)) => {
                     crate::background_error!(REFERENCE_CACHE, "completion_write", Warning, error = %e, "reference cache: completion write failed");
                     write_outcome("completion", "error");
@@ -548,11 +558,14 @@ pub async fn run_sweeper(store: ReferenceStore, interval: Duration, shutdown: Ca
             _ = shutdown.cancelled() => break,
             _ = ticker.tick() => {}
         }
-        loop {
+        // Bound work per tick as well as per statement. A large expiry backlog must
+        // not turn this optional maintenance task into a continuous database load.
+        for _ in 0..10 {
             match store.sweep_expired(SWEEP_BATCH, SWEEP_GRACE).await {
                 Ok(n) if n < SWEEP_BATCH as u64 => break,
                 Ok(_) if shutdown.is_cancelled() => break,
                 Ok(_) => continue,
+                Err(sqlx::Error::PoolTimedOut) => break,
                 Err(e) => {
                     crate::background_error!(REFERENCE_CACHE, "sweep", Warning, error = %e, "reference cache: sweep failed");
                     break;

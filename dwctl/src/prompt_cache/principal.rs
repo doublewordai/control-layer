@@ -35,6 +35,7 @@ pub struct PrincipalResolver {
     /// Live provider (not a pinned pool): survives runtime pool swaps.
     pool: sqlx_pool_router::DynPools,
     l1: Cache<[u8; 32], Option<UserId>>,
+    query_timeout: Option<Duration>,
 }
 
 impl PrincipalResolver {
@@ -54,7 +55,15 @@ impl PrincipalResolver {
         Self {
             pool: sqlx_pool_router::DynPools::new(pool),
             l1,
+            query_timeout: None,
         }
+    }
+
+    /// Bound an optional caller's server work, even if it abandons its query future.
+    /// Transaction-local settings work through transaction-mode poolers too.
+    pub fn with_query_timeout(mut self, timeout: Duration) -> Self {
+        self.query_timeout = Some(timeout);
+        self
     }
 
     /// Resolve the hash of a validated key to its billing principal. `None` => the
@@ -74,8 +83,19 @@ impl PrincipalResolver {
             cache_metrics::record_principal_resolve(if cached.is_some() { "hit" } else { "unknown_key" });
             return Ok(cached);
         }
-        let mut conn = self.pool.write().acquire().await?;
-        let user_id = ApiKeys::new(&mut conn).get_user_id_by_hash(token_hash).await?;
+        let user_id = if let Some(timeout) = self.query_timeout {
+            let mut tx = self.pool.write().begin().await?;
+            sqlx::query("SELECT set_config('statement_timeout', $1, true), set_config('lock_timeout', '250ms', true)")
+                .bind(format!("{}ms", timeout.as_millis().max(1)))
+                .execute(&mut *tx)
+                .await?;
+            let user_id = ApiKeys::new(&mut tx).get_user_id_by_hash(token_hash).await?;
+            tx.commit().await?;
+            user_id
+        } else {
+            let mut conn = self.pool.write().acquire().await?;
+            ApiKeys::new(&mut conn).get_user_id_by_hash(token_hash).await?
+        };
         cache_metrics::record_principal_resolve(if user_id.is_some() { "miss" } else { "unknown_key" });
         self.l1.insert(*token_hash, user_id).await;
         Ok(user_id)
