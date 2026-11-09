@@ -35,15 +35,48 @@ class PreviewWorkflowTest < Minitest::Test
 
   def test_closing_a_preview_pr_publishes_only_its_source_identity
     workflow = File.read(File.join(ROOT, ".github", "workflows", "preview-close.yml"))
+    close_job = workflow[/^  close:\n.*?(?=^  \S|\z)/m]
 
-    assert_includes workflow, "types: [closed]"
-    assert_includes workflow, "startsWith(github.head_ref, 'preview/')"
-    assert_includes workflow, "github.event.pull_request.head.repo.full_name == github.repository"
-    assert_includes workflow, "preview-closed"
-    assert_includes workflow, "context.payload.pull_request.head.sha"
+    assert_includes workflow, "types: [closed, labeled, unlabeled]"
+    refute_nil close_job
+    assert_includes close_job, "github.event.action == 'closed'"
+    assert_includes close_job, "startsWith(github.head_ref, 'preview/')"
+    assert_includes close_job, "github.event.pull_request.head.repo.full_name == github.repository"
+    assert_includes close_job, "preview-closed"
+    assert_includes close_job, "context.payload.pull_request.head.sha"
     refute_includes workflow, "artifact_kind"
     refute_includes workflow, "pull_request_target"
     refute_includes workflow, "doubleword.ai"
+  end
+
+  def test_load_test_label_changes_dispatch_only_the_authoritative_preview_identity
+    workflow = File.read(File.join(ROOT, ".github", "workflows", "preview-close.yml"))
+    load_test_changed_job = workflow[/^  load-test-changed:\n.*?(?=^  \S|\z)/m]
+
+    assert_includes workflow, "types: [closed, labeled, unlabeled]"
+    refute_nil load_test_changed_job
+    assert_includes load_test_changed_job, "github.event.action == 'labeled' || github.event.action == 'unlabeled'"
+    assert_includes load_test_changed_job, "github.event.label.name == 'load-test'"
+    assert_includes load_test_changed_job, "startsWith(github.event.pull_request.head.ref, 'preview/')"
+    assert_includes load_test_changed_job,
+                    "github.event.pull_request.head.repo.full_name == github.repository"
+    assert_includes load_test_changed_job, "github-token: ${{ secrets.PREVIEW_DISPATCH_TOKEN }}"
+    assert_includes load_test_changed_job, "owner: '${{ secrets.DEPLOY_TARGET_OWNER }}'"
+    assert_includes load_test_changed_job, "repo: '${{ secrets.DEPLOY_TARGET_REPO }}'"
+    assert_includes load_test_changed_job, "event_type: 'preview-load-test-changed'"
+
+    client_payload = load_test_changed_job[/client_payload: \{\n(?<fields>(?:^                .*\n)*)^              \}\n            \}\)/m, :fields]
+    refute_nil client_payload
+    expected_client_payload = <<~PAYLOAD
+      repository: context.repo.owner + '/' + context.repo.repo,
+      pull_request: context.payload.pull_request.number,
+      branch: context.payload.pull_request.head.ref,
+      sha: context.payload.pull_request.head.sha
+    PAYLOAD
+    normalized_client_payload = client_payload.lines.map(&:strip).reject(&:empty?).join("\n")
+
+    assert_equal expected_client_payload.strip, normalized_client_payload
+    refute_includes workflow, "pull_request_target"
   end
 
   def test_preview_workflows_pin_reusable_actions
