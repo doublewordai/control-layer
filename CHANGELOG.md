@@ -1,5 +1,12 @@
 # Changelog
 
+## [17.1.1](https://github.com/doublewordai/control-layer/compare/v17.1.0...v17.1.1) (2026-11-11)
+
+
+### Bug Fixes
+
+* **inference:** normalise stream options on outbound requests ([#2181](https://github.com/doublewordai/control-layer/issues/2181)) ([6e9c234](https://github.com/doublewordai/control-layer/commit/6e9c2344cdc3e68a9a59115c06da94db022d78dd))
+
 ## [17.1.0](https://github.com/doublewordai/control-layer/compare/v17.0.0...v17.1.0) (2026-11-06)
 
 
