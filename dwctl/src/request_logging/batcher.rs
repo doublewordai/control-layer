@@ -3539,6 +3539,11 @@ mod integration_tests {
         let clamped = clamp_implicit_read_multiplier(Some(mults), Some("engine")).unwrap();
         assert_eq!(clamped.read, Decimal::ONE);
         assert_eq!(clamped.write_1h, Decimal::TWO, "write premiums untouched");
+        // An assured read billed from the reference estimate is implicit too.
+        assert_eq!(
+            clamp_implicit_read_multiplier(Some(mults), Some("reference")).unwrap().read,
+            Decimal::ONE
+        );
         // Module-sourced (explicit) read: configured multiplier stands.
         assert_eq!(
             clamp_implicit_read_multiplier(Some(mults), Some("module")).unwrap().read,

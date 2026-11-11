@@ -16,13 +16,17 @@ use super::index::{CacheEntry, IndexScope, PrefixHash, TtlTier};
 /// prefix-cache classifier (explicit markers / auto marker placement — the guaranteed,
 /// TTL-smoothed system). `Engine` = the upstream's own reported prefix-cache hit, passed
 /// through as an implicit discount on a tariffed model (engine-cache passthrough: best
-/// effort, no guarantees, whatever the engine/provider actually achieved). Recorded in
+/// effort, no guarantees, whatever the engine/provider actually achieved). `Reference` =
+/// an unmarked request from an organisation with cache-assurance terms, billed above the
+/// engine's hit from the reference-cache estimate ([`crate::reference_cache::assurance`]);
+/// the engine's own hit stays in `engine_cached_tokens`. Recorded in
 /// `http_analytics.cache_read_source` for the achieved-vs-billed comparison; creations
 /// are always the module's, so they carry no source.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CacheReadSource {
     Module,
     Engine,
+    Reference,
 }
 
 impl CacheReadSource {
@@ -31,7 +35,14 @@ impl CacheReadSource {
         match self {
             Self::Module => "module",
             Self::Engine => "engine",
+            Self::Reference => "reference",
         }
+    }
+
+    /// An implicit read: billed without the customer sending cache markers, so it never
+    /// bills above list price.
+    pub fn is_implicit(self) -> bool {
+        matches!(self, Self::Engine | Self::Reference)
     }
 }
 
@@ -42,6 +53,11 @@ pub struct BilledCache {
     pub stats: CacheStats,
     /// `None` when the billed read is zero (creations may still be non-zero).
     pub read_source: Option<CacheReadSource>,
+    /// The reference-cache estimate this request was billed against, recorded as
+    /// `http_analytics.reference_cached_tokens`. Carried here, next to the billed read,
+    /// so the two can never come from different estimates. `None` for a request the
+    /// reference cache does not cover or could not estimate in time.
+    pub reference: Option<u64>,
 }
 
 /// Internal cache accounting shared with outlet through response extensions.

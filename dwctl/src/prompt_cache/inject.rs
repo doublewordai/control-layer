@@ -29,6 +29,7 @@ use tracing::error;
 
 use super::parse::{TELEMETRY_ROLE, TelemetryPolicy};
 use super::stats::{BilledCache, CacheBilling, CacheReadSource, CacheStats};
+use crate::reference_cache::Joined;
 
 /// The upstream's `prompt_tokens_details.cached_tokens` exactly as it arrived, captured
 /// BEFORE this layer zeroes it (inactive model) or overwrites it with dwctl's own read
@@ -40,8 +41,11 @@ use super::stats::{BilledCache, CacheBilling, CacheReadSource, CacheStats};
 /// extensions when the response head arrives, so the cell is inserted then and filled
 /// later — for a stream, at the terminal usage frame — through the shared `Arc`. Analytics
 /// runs after the body completes and reads the filled cell.
+///
+/// The usage's `prompt_tokens` rides along, for the reference estimate of a request whose
+/// usage this layer only scrubs.
 #[derive(Clone, Debug, Default)]
-pub struct UpstreamCachedTokens(Arc<OnceLock<u64>>);
+pub struct UpstreamCachedTokens(Arc<OnceLock<u64>>, Arc<OnceLock<u64>>);
 
 impl UpstreamCachedTokens {
     /// `None` until a usage object has been seen. First write wins.
@@ -51,6 +55,15 @@ impl UpstreamCachedTokens {
 
     pub(crate) fn set(&self, value: u64) {
         let _ = self.0.set(value);
+    }
+
+    /// The upstream's `prompt_tokens`, from the same usage object.
+    pub fn prompt_tokens(&self) -> Option<u64> {
+        self.1.get().copied()
+    }
+
+    pub(crate) fn set_prompt_tokens(&self, value: u64) {
+        let _ = self.1.set(value);
     }
 }
 
@@ -69,9 +82,26 @@ fn upstream_cached_tokens(usage: &serde_json::Map<String, Value>) -> Option<u64>
 }
 
 /// [`upstream_cached_tokens`] for a non-streaming JSON body.
+#[cfg(test)]
 pub(crate) fn read_upstream_cached_tokens_json(body: &[u8]) -> Option<u64> {
     let json: Value = serde_json::from_slice(body).ok()?;
     upstream_cached_tokens(json.get("usage")?.as_object()?)
+}
+
+/// Capture a non-streaming JSON body's upstream cached and prompt tokens into `capture`.
+fn capture_upstream_usage_json(body: &[u8], capture: &UpstreamCachedTokens) {
+    let Ok(json) = serde_json::from_slice::<Value>(body) else {
+        return;
+    };
+    let Some(usage) = json.get("usage").and_then(Value::as_object) else {
+        return;
+    };
+    if let Some(v) = upstream_cached_tokens(usage) {
+        capture.set(v);
+    }
+    if let Some(v) = usage.get("prompt_tokens").and_then(Value::as_u64) {
+        capture.set_prompt_tokens(v);
+    }
 }
 
 /// Remove `cache_control` markers from the request body at exactly the locations the parser
@@ -278,11 +308,21 @@ pub fn scrub_usage_json(body: &[u8]) -> Option<Bytes> {
 /// passthrough; billing additionally clamps the read multiplier to 1 for engine-sourced
 /// reads (a >1 multiplier is a misconfiguration — an unmarked customer must never pay
 /// above list price for a cache hit).
+///
+/// **Assured billing** (`reference` carries terms and an estimate): an unarmed request
+/// from an organisation with cache-assurance terms bills
+/// [`crate::reference_cache::CacheAssurance::billed_read`] of the engine's hit and the
+/// reference estimate instead — never less than the engine's hit, sourced `Reference`
+/// when it is more. Without an estimate in time (the lookup missed its deadline or
+/// failed) it falls back to the engine passthrough above. An armed request never takes
+/// this branch. Either way the estimate is returned in [`BilledCache::reference`], the
+/// one value analytics records.
 fn splice_cache_fields(
     usage: &mut serde_json::Map<String, Value>,
     stats: &CacheStats,
     model: Option<&str>,
     allow_implicit: bool,
+    reference: Option<&Joined>,
 ) -> BilledCache {
     // Read the upstream's own cache report BEFORE the scrub deletes/zeroes it.
     let engine_reported = upstream_cached_tokens(usage);
@@ -323,12 +363,29 @@ fn splice_cache_fields(
     // `prompt_tokens` (an engine value above the prompt is upstream nonsense — the cap
     // is the distrust guard); without a `prompt_tokens` to bound it there is no
     // passthrough.
+    let prompt_tokens = usage.get("prompt_tokens").and_then(Value::as_u64);
+    let estimate = reference.zip(prompt_tokens).and_then(|(r, prompt)| r.estimate(prompt));
     let mut read_source = (read > 0).then_some(CacheReadSource::Module);
-    if allow_implicit && let (Some(engine), Some(prompt)) = (engine_reported, usage.get("prompt_tokens").and_then(Value::as_u64)) {
-        let engine_capped = engine.min(prompt);
-        if engine_capped > 0 {
-            read = engine_capped;
-            read_source = Some(CacheReadSource::Engine);
+    if allow_implicit && let Some(prompt) = prompt_tokens {
+        let engine_capped = engine_reported.map(|engine| engine.min(prompt));
+        match (reference.and_then(Joined::terms), estimate) {
+            (Some(terms), Some(estimate)) => {
+                let engine = engine_capped.unwrap_or(0);
+                read = terms.billed_read(engine, estimate, prompt);
+                read_source = if read > engine {
+                    Some(CacheReadSource::Reference)
+                } else {
+                    (read > 0).then_some(CacheReadSource::Engine)
+                };
+            }
+            _ => {
+                if let Some(engine_capped) = engine_capped
+                    && engine_capped > 0
+                {
+                    read = engine_capped;
+                    read_source = Some(CacheReadSource::Engine);
+                }
+            }
         }
     }
 
@@ -355,17 +412,23 @@ fn splice_cache_fields(
             ..*stats
         },
         read_source,
+        reference: estimate,
     }
 }
 
 /// Inject the cache stats into a non-streaming chat-completion JSON body. Returns
 /// the rewritten body and capped billing counts, or `None` if there is no usage.
-pub fn inject_into_usage_json(body: &[u8], stats: &CacheStats, allow_implicit: bool) -> Option<(Bytes, BilledCache)> {
+pub fn inject_into_usage_json(
+    body: &[u8],
+    stats: &CacheStats,
+    allow_implicit: bool,
+    reference: Option<&Joined>,
+) -> Option<(Bytes, BilledCache)> {
     let mut json: Value = serde_json::from_slice(body).ok()?;
     let obj = json.as_object_mut()?;
     let model = obj.get("model").and_then(Value::as_str).map(String::from);
     let usage = obj.get_mut("usage")?.as_object_mut()?;
-    let billed = splice_cache_fields(usage, stats, model.as_deref(), allow_implicit);
+    let billed = splice_cache_fields(usage, stats, model.as_deref(), allow_implicit, reference);
     serde_json::to_vec(&json).ok().map(|body| (Bytes::from(body), billed))
 }
 
@@ -381,6 +444,8 @@ pub(crate) struct SseScan {
     pub saw_usage: bool,
     /// The upstream's `cached_tokens` from that usage frame, read before any edit.
     pub upstream_cached_tokens: Option<u64>,
+    /// The usage frame's `prompt_tokens`.
+    pub prompt_tokens: Option<u64>,
     /// Capped counts + read source, populated only when cache usage was successfully emitted.
     pub billing_stats: Option<BilledCache>,
 }
@@ -394,7 +459,11 @@ pub(crate) enum UsageEdit<'a> {
     /// Splice the caching module's stats into the usage frame (active, cache-enabled
     /// request) — or, for an UNARMED request, the engine-cache passthrough
     /// (see `splice_cache_fields`).
-    Inject { stats: &'a CacheStats, allow_implicit: bool },
+    Inject {
+        stats: &'a CacheStats,
+        allow_implicit: bool,
+        reference: Option<&'a Joined>,
+    },
     /// Remove provider-written cache fields from the usage frame (inactive request — the
     /// customer must not see an upstream's own cache accounting).
     Scrub,
@@ -420,6 +489,7 @@ pub(crate) fn scan_edit_sse(body: &[u8], edit: UsageEdit) -> SseScan {
             saw_error: false,
             saw_usage: false,
             upstream_cached_tokens: None,
+            prompt_tokens: None,
             billing_stats: None,
         };
     };
@@ -431,12 +501,14 @@ pub(crate) fn scan_edit_sse(body: &[u8], edit: UsageEdit) -> SseScan {
         let mut saw_error = false;
         let mut saw_usage = false;
         let mut upstream = None;
+        let mut prompt_tokens = None;
         for line in body_str.split('\n') {
             if let Some(chunk) = sse_data_json(line) {
                 saw_error |= chunk.get("error").is_some();
                 if let Some(usage) = chunk.get("usage").and_then(Value::as_object) {
                     saw_usage = true;
                     upstream = upstream.or_else(|| upstream_cached_tokens(usage));
+                    prompt_tokens = prompt_tokens.or_else(|| usage.get("prompt_tokens").and_then(Value::as_u64));
                 }
             }
         }
@@ -445,6 +517,7 @@ pub(crate) fn scan_edit_sse(body: &[u8], edit: UsageEdit) -> SseScan {
             saw_error,
             saw_usage,
             upstream_cached_tokens: upstream,
+            prompt_tokens,
             billing_stats: None,
         };
     }
@@ -484,8 +557,12 @@ pub(crate) fn scan_edit_sse(body: &[u8], edit: UsageEdit) -> SseScan {
                     let changed = match edit {
                         // Probe returned on the fast path above; a frame can't reach here.
                         UsageEdit::Probe => false,
-                        UsageEdit::Inject { stats, allow_implicit } => {
-                            billed = Some(splice_cache_fields(usage_obj, stats, model.as_deref(), allow_implicit));
+                        UsageEdit::Inject {
+                            stats,
+                            allow_implicit,
+                            reference,
+                        } => {
+                            billed = Some(splice_cache_fields(usage_obj, stats, model.as_deref(), allow_implicit, reference));
                             true
                         }
                         // A clean frame needs no rewrite — keep the original bytes.
@@ -512,6 +589,7 @@ pub(crate) fn scan_edit_sse(body: &[u8], edit: UsageEdit) -> SseScan {
         saw_error,
         saw_usage,
         upstream_cached_tokens: upstream,
+        prompt_tokens: None,
         billing_stats,
     }
 }
@@ -535,7 +613,15 @@ fn sse_data_json(line: &str) -> Option<Value> {
 /// frame is found. (Thin wrapper over [`scan_edit_sse`]; the streaming path uses the
 /// scan directly to also collect the commit-gate signals.)
 pub fn inject_into_sse_body(body: &[u8], stats: &CacheStats, allow_implicit: bool) -> Option<Bytes> {
-    scan_edit_sse(body, UsageEdit::Inject { stats, allow_implicit }).rewritten
+    scan_edit_sse(
+        body,
+        UsageEdit::Inject {
+            stats,
+            allow_implicit,
+            reference: None,
+        },
+    )
+    .rewritten
 }
 
 /// Scrub provider cache fields from the terminal usage frame of an SSE body. `None` when the
@@ -555,6 +641,7 @@ pub async fn inject_into_response_nonstreaming(
     stats: &CacheStats,
     capture: &UpstreamCachedTokens,
     allow_implicit: bool,
+    reference: Option<&Joined>,
 ) -> (Response, bool) {
     let status_ok = response.status().is_success();
 
@@ -596,10 +683,8 @@ pub async fn inject_into_response_nonstreaming(
 
     // A present `usage` object is billing's success signal for a non-streamed call (it's where
     // token counts come from); combined with a 2xx status, it gates the write.
-    if let Some(v) = read_upstream_cached_tokens_json(&body_bytes) {
-        capture.set(v);
-    }
-    match inject_into_usage_json(&body_bytes, stats, allow_implicit) {
+    capture_upstream_usage_json(&body_bytes, capture);
+    match inject_into_usage_json(&body_bytes, stats, allow_implicit, reference) {
         Some((rewritten, billed)) => {
             if let Some(capture) = parts.extensions.get::<CacheBilling>() {
                 capture.set(billed);
@@ -668,9 +753,7 @@ pub async fn scrub_response_nonstreaming(response: Response, capture: &UpstreamC
         }
     };
 
-    if let Some(v) = read_upstream_cached_tokens_json(&body_bytes) {
-        capture.set(v);
-    }
+    capture_upstream_usage_json(&body_bytes, capture);
     let rewritten = scrub_usage_json(&body_bytes);
     if rewritten.is_some() {
         // We emit plain JSON (parse succeeded), so drop any stale Content-Encoding.
@@ -725,6 +808,7 @@ mod tests {
     fn module_billed(stats: CacheStats) -> BilledCache {
         BilledCache {
             read_source: (stats.read > 0).then_some(CacheReadSource::Module),
+            reference: None,
             stats,
         }
     }
@@ -956,7 +1040,7 @@ mod tests {
     #[test]
     fn inject_non_streaming_adds_cache_fields() {
         let body = serde_json::json!({"usage":{"prompt_tokens":2000,"completion_tokens":5}}).to_string();
-        let (out, billed) = inject_into_usage_json(body.as_bytes(), &stats(), false).unwrap();
+        let (out, billed) = inject_into_usage_json(body.as_bytes(), &stats(), false, None).unwrap();
         assert_eq!(billed, module_billed(stats()));
         let v: Value = serde_json::from_slice(&out).unwrap();
         assert_eq!(v["usage"]["prompt_tokens"], 2000, "total preserved");
@@ -972,7 +1056,7 @@ mod tests {
         // the engine's prompt_tokens (1000). The customer must never see an impossible
         // split — the read is capped to fit, mirroring the billing cap exactly.
         let body = serde_json::json!({"usage":{"prompt_tokens":1000,"completion_tokens":5}}).to_string();
-        let (out, billed) = inject_into_usage_json(body.as_bytes(), &stats(), false).unwrap();
+        let (out, billed) = inject_into_usage_json(body.as_bytes(), &stats(), false, None).unwrap();
         assert_eq!(billed, module_billed(CacheStats { read: 940, ..stats() }));
         let v: Value = serde_json::from_slice(&out).unwrap();
         assert_eq!(v["usage"]["prompt_tokens"], 1000, "engine total preserved");
@@ -987,7 +1071,7 @@ mod tests {
         // list price, so the reported usage shows no cache activity either — the two views
         // must agree.
         let body = serde_json::json!({"usage":{"prompt_tokens":50,"completion_tokens":5}}).to_string();
-        let (out, billed) = inject_into_usage_json(body.as_bytes(), &stats(), false).unwrap();
+        let (out, billed) = inject_into_usage_json(body.as_bytes(), &stats(), false, None).unwrap();
         assert_eq!(billed, BilledCache::default());
         let v: Value = serde_json::from_slice(&out).unwrap();
         assert_eq!(v["usage"]["cache_read_input_tokens"], 0);
@@ -999,7 +1083,7 @@ mod tests {
     #[test]
     fn inject_non_streaming_none_when_no_usage() {
         let body = serde_json::json!({"choices":[]}).to_string();
-        assert!(inject_into_usage_json(body.as_bytes(), &stats(), false).is_none());
+        assert!(inject_into_usage_json(body.as_bytes(), &stats(), false, None).is_none());
     }
 
     #[test]
@@ -1015,6 +1099,7 @@ mod tests {
                 UsageEdit::Inject {
                     stats: &stats(),
                     allow_implicit: false,
+                    reference: None,
                 },
             );
             assert_eq!(scan.billing_stats, Some(expected));
@@ -1029,7 +1114,8 @@ mod tests {
                 b"data: {\"choices\":[]}\n\n",
                 UsageEdit::Inject {
                     stats: &stats(),
-                    allow_implicit: false
+                    allow_implicit: false,
+                    reference: None,
                 }
             )
             .billing_stats
@@ -1046,7 +1132,7 @@ mod tests {
             "prompt_tokens_details": {"cached_tokens": 687}
         }})
         .to_string();
-        let (out, billed) = inject_into_usage_json(body.as_bytes(), &CacheStats::default(), true).unwrap();
+        let (out, billed) = inject_into_usage_json(body.as_bytes(), &CacheStats::default(), true, None).unwrap();
         assert_eq!(billed.stats.read, 687);
         assert_eq!(billed.stats.creation_total(), 0);
         assert_eq!(billed.read_source, Some(CacheReadSource::Engine));
@@ -1071,7 +1157,7 @@ mod tests {
             "prompt_tokens_details": {"cached_tokens": 800}
         }})
         .to_string();
-        let (out, billed) = inject_into_usage_json(body.as_bytes(), &module, false).unwrap();
+        let (out, billed) = inject_into_usage_json(body.as_bytes(), &module, false, None).unwrap();
         assert_eq!((billed.stats.read, billed.read_source), (200, Some(CacheReadSource::Module)));
         let v: Value = serde_json::from_slice(&out).unwrap();
         assert_eq!(v["usage"]["cache_read_input_tokens"], 200, "customer sees the module read");
@@ -1086,7 +1172,7 @@ mod tests {
             "prompt_tokens_details": {"cached_tokens": 200}
         }})
         .to_string();
-        let (_, billed) = inject_into_usage_json(body.as_bytes(), &module, false).unwrap();
+        let (_, billed) = inject_into_usage_json(body.as_bytes(), &module, false, None).unwrap();
         assert_eq!((billed.stats.read, billed.read_source), (500, Some(CacheReadSource::Module)));
     }
 
@@ -1104,7 +1190,7 @@ mod tests {
             "prompt_tokens_details": {"cached_tokens": 900}
         }})
         .to_string();
-        let (out, billed) = inject_into_usage_json(body.as_bytes(), &module, false).unwrap();
+        let (out, billed) = inject_into_usage_json(body.as_bytes(), &module, false, None).unwrap();
         assert_eq!(billed.stats.read, 0, "no engine read on an explicit write leg");
         assert_eq!(billed.stats.creation_1h, 300, "the write bills as normal");
         assert_eq!(billed.read_source, None);
@@ -1125,7 +1211,7 @@ mod tests {
             "prompt_tokens_details": {"cached_tokens": 5000}
         }})
         .to_string();
-        let (_, billed) = inject_into_usage_json(body.as_bytes(), &CacheStats::default(), true).unwrap();
+        let (_, billed) = inject_into_usage_json(body.as_bytes(), &CacheStats::default(), true, None).unwrap();
         assert_eq!((billed.stats.read, billed.read_source), (100, Some(CacheReadSource::Engine)));
 
         // No `prompt_tokens` to bound it → no passthrough (module split unchanged).
@@ -1134,7 +1220,7 @@ mod tests {
             "prompt_tokens_details": {"cached_tokens": 687}
         }})
         .to_string();
-        let (_, billed) = inject_into_usage_json(body.as_bytes(), &CacheStats::default(), true).unwrap();
+        let (_, billed) = inject_into_usage_json(body.as_bytes(), &CacheStats::default(), true, None).unwrap();
         assert_eq!((billed.stats.read, billed.read_source), (0, None));
     }
 
@@ -1148,7 +1234,7 @@ mod tests {
             "prompt_cache_hit_tokens": 400
         }})
         .to_string();
-        let (out, billed) = inject_into_usage_json(body.as_bytes(), &CacheStats::default(), true).unwrap();
+        let (out, billed) = inject_into_usage_json(body.as_bytes(), &CacheStats::default(), true, None).unwrap();
         assert_eq!((billed.stats.read, billed.read_source), (0, None));
         let v: Value = serde_json::from_slice(&out).unwrap();
         assert!(v["usage"].get("prompt_cache_hit_tokens").is_none(), "dialect field scrubbed");
@@ -1167,7 +1253,7 @@ mod tests {
             "prompt_tokens_details": {"cached_tokens": 687}
         }})
         .to_string();
-        let (out, billed) = inject_into_usage_json(body.as_bytes(), &CacheStats::default(), false).unwrap();
+        let (out, billed) = inject_into_usage_json(body.as_bytes(), &CacheStats::default(), false, None).unwrap();
         assert_eq!((billed.stats.read, billed.read_source), (0, None));
         let v: Value = serde_json::from_slice(&out).unwrap();
         assert_eq!(v["usage"]["prompt_tokens_details"]["cached_tokens"], 0);
@@ -1189,9 +1275,98 @@ mod tests {
             "prompt_tokens_details": {"cached_tokens": 40}
         }})
         .to_string();
-        let (_, billed) = inject_into_usage_json(body.as_bytes(), &module, false).unwrap();
+        let (_, billed) = inject_into_usage_json(body.as_bytes(), &module, false, None).unwrap();
         assert_eq!(billed.stats.creation_total(), 0, "corrupt module writes zeroed");
         assert_eq!((billed.stats.read, billed.read_source), (0, None));
+    }
+
+    fn assured_usage(engine: Option<u64>) -> String {
+        let details = engine.map_or(String::new(), |e| format!(r#","prompt_tokens_details":{{"cached_tokens":{e}}}"#));
+        format!(r#"{{"model":"m","usage":{{"prompt_tokens":1000,"completion_tokens":5,"total_tokens":1005{details}}}}}"#)
+    }
+
+    fn assured(engine: Option<u64>, allow_implicit: bool, reference: &Joined, stats: &CacheStats) -> (Value, BilledCache) {
+        let (out, billed) = inject_into_usage_json(assured_usage(engine).as_bytes(), stats, allow_implicit, Some(reference)).unwrap();
+        (serde_json::from_slice::<Value>(&out).unwrap()["usage"].clone(), billed)
+    }
+
+    #[test]
+    fn assured_terms_bill_part_of_the_gap_and_report_it() {
+        let org = uuid::Uuid::new_v4();
+        let terms = Some(crate::reference_cache::CacheAssurance::GapShare(0.4));
+        let (usage, billed) = assured(Some(500), true, &Joined::ready_with(org, terms, 900), &CacheStats::default());
+        // 500 + 0.4 × 400.
+        assert_eq!((billed.stats.read, billed.read_source), (660, Some(CacheReadSource::Reference)));
+        assert_eq!(billed.reference, Some(900), "the estimate billed against is the one recorded");
+        assert_eq!(usage["prompt_tokens_details"]["cached_tokens"], 660);
+        assert_eq!(usage["cache_read_input_tokens"], 660);
+        assert_eq!(usage["cache_creation_input_tokens"], 0);
+
+        // The reference saw no more than the engine: an engine read, unchanged.
+        let (_, billed) = assured(Some(500), true, &Joined::ready_with(org, terms, 400), &CacheStats::default());
+        assert_eq!(
+            (billed.stats.read, billed.read_source, billed.reference),
+            (500, Some(CacheReadSource::Engine), Some(400))
+        );
+
+        // No engine report at all: the gap is the whole estimate.
+        let (_, billed) = assured(None, true, &Joined::ready_with(org, terms, 900), &CacheStats::default());
+        assert_eq!((billed.stats.read, billed.read_source), (360, Some(CacheReadSource::Reference)));
+
+        // An estimate above the prompt is capped to it first.
+        let (_, billed) = assured(
+            Some(0),
+            true,
+            &Joined::ready_with(org, Some(crate::reference_cache::CacheAssurance::GapShare(1.0)), 5_000),
+            &CacheStats::default(),
+        );
+        assert_eq!((billed.stats.read, billed.reference), (1_000, Some(1_000)));
+    }
+
+    #[test]
+    fn without_an_estimate_assured_terms_fall_back_to_the_engine() {
+        let unavailable = Joined::Unavailable {
+            coverage: Some(crate::reference_cache::Coverage {
+                principal: uuid::Uuid::new_v4(),
+                terms: Some(crate::reference_cache::CacheAssurance::GapShare(0.4)),
+            }),
+            outcome: "deadline_exceeded",
+        };
+        let (usage, billed) = assured(Some(500), true, &unavailable, &CacheStats::default());
+        assert_eq!(
+            (billed.stats.read, billed.read_source, billed.reference),
+            (500, Some(CacheReadSource::Engine), None)
+        );
+        assert_eq!(usage["prompt_tokens_details"]["cached_tokens"], 500);
+    }
+
+    #[test]
+    fn the_estimate_without_terms_is_recorded_not_billed() {
+        let (_, billed) = assured(
+            Some(500),
+            true,
+            &Joined::ready_with(uuid::Uuid::new_v4(), None, 900),
+            &CacheStats::default(),
+        );
+        assert_eq!(
+            (billed.stats.read, billed.read_source, billed.reference),
+            (500, Some(CacheReadSource::Engine), Some(900))
+        );
+    }
+
+    #[test]
+    fn marked_requests_ignore_assured_terms() {
+        let terms = Some(crate::reference_cache::CacheAssurance::GapShare(1.0));
+        let module = CacheStats {
+            read: 200,
+            creation_5m: 300,
+            ..Default::default()
+        };
+        let (usage, billed) = assured(Some(500), false, &Joined::ready_with(uuid::Uuid::new_v4(), terms, 900), &module);
+        assert_eq!((billed.stats.read, billed.read_source), (200, Some(CacheReadSource::Module)));
+        assert_eq!(billed.stats.creation_5m, 300);
+        assert_eq!(billed.reference, Some(900), "still recorded");
+        assert_eq!(usage["prompt_tokens_details"]["cached_tokens"], 200);
     }
 
     #[test]
@@ -1202,6 +1377,7 @@ mod tests {
             UsageEdit::Inject {
                 stats: &CacheStats::default(),
                 allow_implicit: true,
+                reference: None,
             },
         );
         let billed = scan.billing_stats.unwrap();
@@ -1284,7 +1460,7 @@ mod tests {
             .header("content-type", "application/json")
             .body(Body::from(serde_json::json!({"error":{"message":"bad request"}}).to_string()))
             .unwrap();
-        let (_out, billing_ok) = inject_into_response_nonstreaming(resp, &stats(), &UpstreamCachedTokens::default(), false).await;
+        let (_out, billing_ok) = inject_into_response_nonstreaming(resp, &stats(), &UpstreamCachedTokens::default(), false, None).await;
         assert!(!billing_ok, "error body → no commit");
     }
 
@@ -1296,7 +1472,7 @@ mod tests {
             .header("content-type", "application/json")
             .body(Body::from(serde_json::json!({"usage":{"prompt_tokens":2000}}).to_string()))
             .unwrap();
-        let (out, billing_ok) = inject_into_response_nonstreaming(resp, &stats(), &UpstreamCachedTokens::default(), false).await;
+        let (out, billing_ok) = inject_into_response_nonstreaming(resp, &stats(), &UpstreamCachedTokens::default(), false, None).await;
         assert!(billing_ok, "2xx with usage → commit allowed");
         let collected = axum::body::to_bytes(out.into_body(), usize::MAX).await.unwrap();
         let s = std::str::from_utf8(&collected).unwrap();
@@ -1353,7 +1529,7 @@ mod tests {
             "cache_discount": 0.5
         }})
         .to_string();
-        let (out, _) = inject_into_usage_json(body.as_bytes(), &stats(), false).unwrap();
+        let (out, _) = inject_into_usage_json(body.as_bytes(), &stats(), false, None).unwrap();
         let v: Value = serde_json::from_slice(&out).unwrap();
         let usage = v["usage"].as_object().unwrap();
         assert!(!usage.contains_key("prompt_cache_hit_tokens"));

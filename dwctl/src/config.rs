@@ -236,9 +236,9 @@ pub struct Config {
     /// See [`crate::prefix_chain::PrefixChainConfig`].
     #[serde(default)]
     pub prefix_chain: crate::prefix_chain::PrefixChainConfig,
-    /// Shadow reference-cache estimate (`http_analytics.reference_cached_tokens`) for
-    /// allowlisted principals. Off by default. See
-    /// [`crate::reference_cache::ReferenceCacheConfig`].
+    /// Reference-cache estimate (`http_analytics.reference_cached_tokens`) for listed
+    /// principals and for organisations with cache-assurance terms, which are billed
+    /// from it. Off by default. See [`crate::reference_cache::ReferenceCacheConfig`].
     #[serde(default)]
     pub reference_cache: crate::reference_cache::ReferenceCacheConfig,
     /// Mid-stream continuation (stream resume): the on/off flag, per-origin gates,
@@ -4045,7 +4045,7 @@ impl Config {
                 operation: format!("Config validation: {e}"),
             });
         }
-        if let Err(e) = self.reference_cache.validate(self.enable_analytics) {
+        if let Err(e) = self.reference_cache.validate(self.enable_analytics, self.cache.enabled) {
             return Err(Error::Internal {
                 operation: format!("Config validation: {e}"),
             });

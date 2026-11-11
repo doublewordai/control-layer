@@ -65,17 +65,18 @@ pub(crate) struct CacheTariffRow {
     pub serving_class: Option<String>,
 }
 
-/// An engine-sourced (implicit) cache read must never bill above list price: the customer
-/// sent no markers and never opted into cache pricing, so a read multiplier above 1 —
-/// accepted by tariff validation but a misconfiguration in practice (a surcharge for a
-/// cache hit) — clamps to 1 for these reads only. Module-sourced (explicit) reads keep
-/// the configured multiplier untouched. Shared by the live batcher and the recompute
-/// audit path so both price implicit reads identically.
+/// An implicit cache read — engine-sourced, or reference-sourced (assured billing) — must
+/// never bill above list price: the customer sent no markers and never opted into cache
+/// pricing, so a read multiplier above 1 — accepted by tariff validation but a
+/// misconfiguration in practice (a surcharge for a cache hit) — clamps to 1 for these
+/// reads only. Module-sourced (explicit) reads keep the configured multiplier untouched.
+/// Shared by the live batcher and the recompute audit path so both price implicit reads
+/// identically.
 pub(crate) fn clamp_implicit_read_multiplier(mults: Option<CacheMultipliers>, read_source: Option<&str>) -> Option<CacheMultipliers> {
-    match (mults, read_source) {
-        (Some(m), Some(s)) if s == crate::prompt_cache::CacheReadSource::Engine.as_str() && m.read > Decimal::ONE => {
-            Some(CacheMultipliers { read: Decimal::ONE, ..m })
-        }
+    use crate::prompt_cache::CacheReadSource::{Engine, Reference};
+    let implicit = read_source.is_some_and(|s| s == Engine.as_str() || s == Reference.as_str());
+    match mults {
+        Some(m) if implicit && m.read > Decimal::ONE => Some(CacheMultipliers { read: Decimal::ONE, ..m }),
         _ => mults,
     }
 }

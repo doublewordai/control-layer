@@ -7,7 +7,7 @@
 //! visible; [`ReferenceStore::sweep_expired`] deletes expired rows in bounded batches.
 //!
 //! The store shares the application's pool, so it holds at most `max_connections` of
-//! its connections at once: however many requests are in flight, the shadow estimate
+//! its connections at once: however many requests are in flight, the reference cache
 //! cannot starve the analytics outbox or anything else on that pool.
 
 use std::sync::Arc;

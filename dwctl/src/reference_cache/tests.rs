@@ -1,22 +1,10 @@
 use std::time::Duration;
 
-use axum::Router;
-use axum::body::Body;
-use axum::http::{Method, StatusCode, Uri};
-use axum::response::IntoResponse;
-use axum::routing::post;
 use chrono::{DateTime, Utc};
-use futures::StreamExt;
-use outlet::{RequestData, RequestHandler, ResponseData};
-use tokio::sync::mpsc;
-use tower::ServiceExt;
 
 use super::*;
 use crate::api::models::users::Role;
-use crate::auth::internal_credential::{InternalAuthState, InternalCredentials};
 use crate::crypto::hash_api_key;
-use crate::request_logging::AnalyticsHandler;
-use crate::request_logging::batcher::{AnalyticsOutboxWriter, RawAnalyticsRecord};
 use crate::test::utils::{create_test_api_key_for_user, create_test_user};
 
 const MODEL: &str = "acme/chat-model";
@@ -145,7 +133,7 @@ fn only_new_or_incomplete_boundaries_are_rewritten() {
 #[test]
 fn config_validation() {
     assert!(
-        ReferenceCacheConfig::default().validate(false).is_ok(),
+        ReferenceCacheConfig::default().validate(false, false).is_ok(),
         "disabled ignores everything"
     );
     let enabled = ReferenceCacheConfig {
@@ -153,38 +141,50 @@ fn config_validation() {
         orgs: vec![Uuid::new_v4()],
         ..Default::default()
     };
-    assert!(enabled.validate(true).is_ok());
-    assert!(enabled.validate(false).unwrap_err().contains("enable_analytics"));
+    assert!(enabled.validate(true, true).is_ok());
+    assert!(enabled.validate(false, true).unwrap_err().contains("enable_analytics"));
+    assert!(
+        enabled.validate(true, false).unwrap_err().contains("cache.enabled"),
+        "it runs in the cache layer"
+    );
     let no_orgs = ReferenceCacheConfig {
         orgs: vec![],
         ..enabled.clone()
     };
-    assert!(no_orgs.validate(true).unwrap_err().contains("orgs"));
+    assert!(
+        no_orgs.validate(true, true).is_ok(),
+        "assurance terms cover their organisations without the list"
+    );
+    let no_join = ReferenceCacheConfig {
+        join_deadline_ms: 0,
+        ..enabled.clone()
+    };
+    assert!(no_join.validate(true, true).unwrap_err().contains("join_deadline_ms"));
     let no_models = ReferenceCacheConfig {
         models: Some(vec![]),
         ..enabled.clone()
     };
-    assert!(no_models.validate(true).unwrap_err().contains("models"));
+    assert!(no_models.validate(true, true).unwrap_err().contains("models"));
     let no_ttl = ReferenceCacheConfig {
         ttl_secs: 0,
         ..enabled.clone()
     };
-    assert!(no_ttl.validate(true).unwrap_err().contains("ttl_secs"));
+    assert!(no_ttl.validate(true, true).unwrap_err().contains("ttl_secs"));
     let no_timeout = ReferenceCacheConfig {
         estimate_timeout_ms: 0,
         ..enabled.clone()
     };
-    assert!(no_timeout.validate(true).unwrap_err().contains("estimate_timeout_ms"));
+    assert!(no_timeout.validate(true, true).unwrap_err().contains("estimate_timeout_ms"));
     let no_sweep = ReferenceCacheConfig {
         sweep_interval_secs: 0,
         ..enabled.clone()
     };
-    assert!(no_sweep.validate(true).unwrap_err().contains("sweep_interval_secs"));
+    assert!(no_sweep.validate(true, true).unwrap_err().contains("sweep_interval_secs"));
     let no_connections = ReferenceCacheConfig {
         max_connections: 0,
         ..enabled
     };
-    assert!(no_connections.validate(true).unwrap_err().contains("max_connections"));
+    assert!(no_connections.validate(true, true).unwrap_err().contains("max_connections"));
 }
 
 #[test]
@@ -201,15 +201,16 @@ fn orgs_deserialize_from_a_list_or_a_comma_string() {
 
 // ===== Against the database =====
 
-struct Fixture {
-    cache: Arc<ReferenceCache>,
-    secret: String,
-    key_id: crate::types::ApiKeyId,
-    principal: UserId,
-    pool: sqlx::PgPool,
+pub(super) struct Fixture {
+    pub cache: Arc<ReferenceCache>,
+    pub secret: String,
+    pub principal: UserId,
+    pub pool: sqlx::PgPool,
 }
 
-async fn fixture(pool: sqlx::PgPool, allowlisted: bool, allowance: u32) -> Fixture {
+/// A reference cache covering a fresh user's key: through the `orgs` list when
+/// `allowlisted`, and through `terms` on [`MODEL`] when given.
+pub(super) async fn fixture_with(pool: sqlx::PgPool, allowlisted: bool, allowance: u32, terms: Option<CacheAssurance>) -> Fixture {
     let user = create_test_user(&pool, Role::StandardUser).await;
     let key = create_test_api_key_for_user(&pool, user.id).await;
     let config = ReferenceCacheConfig {
@@ -219,28 +220,32 @@ async fn fixture(pool: sqlx::PgPool, allowlisted: bool, allowance: u32) -> Fixtu
         ..Default::default()
     };
     let (_, telemetry) = policies();
+    let book = AssuranceBook::fixed(terms.map(|t| ((user.id, MODEL.to_string()), t)).into_iter().collect());
     Fixture {
-        cache: Arc::new(ReferenceCache::new(&config, pool.clone(), telemetry)),
+        cache: Arc::new(ReferenceCache::new(&config, pool.clone(), telemetry, Arc::new(book))),
         secret: key.secret.clone(),
-        key_id: key.id,
         principal: user.id,
         pool,
     }
 }
 
+async fn fixture(pool: sqlx::PgPool, allowlisted: bool, allowance: u32) -> Fixture {
+    fixture_with(pool, allowlisted, allowance, None).await
+}
+
 impl Fixture {
-    async fn complete(&self, b: &Bytes, prompt_tokens: i64, arrival: DateTime<Utc>) -> Option<i64> {
-        self.cache
-            .complete(Completion {
-                path: "/ai/v1/chat/completions",
-                success: true,
-                api_key: Some(hash_api_key(&self.secret)),
-                model: Some(MODEL),
-                body: Some(b),
-                prompt_tokens,
-                arrival,
-            })
-            .await
+    /// One successful request, start to finish: the lookup at `arrival`, the estimate
+    /// for `prompt_tokens`, and the completion write.
+    async fn complete(&self, b: &Bytes, prompt_tokens: u64, arrival: DateTime<Utc>) -> Option<u64> {
+        let mut pending = self.cache.begin(hash_api_key(&self.secret), MODEL, MODEL, b.clone(), arrival);
+        let estimate = pending.join(Duration::from_secs(5)).await.estimate(prompt_tokens);
+        pending.finish(Some(prompt_tokens), true);
+        estimate
+    }
+
+    async fn joined(&self, b: &Bytes) -> Joined {
+        let mut pending = self.cache.begin(hash_api_key(&self.secret), MODEL, MODEL, b.clone(), Utc::now());
+        pending.join(Duration::from_secs(5)).await.clone()
     }
 
     /// Poll until the spawned write for `b` has landed: its final boundary is live with
@@ -248,7 +253,7 @@ impl Fixture {
     /// process's clock has passed the entry's `visible_at`, which the database clock
     /// stamps: a request arriving next (stamped with this clock) must see it even when
     /// the database clock runs slightly ahead.
-    async fn wait_for(&self, b: &Bytes, exact: bool) {
+    pub(super) async fn wait_for(&self, b: &Bytes, exact: bool) {
         let last = bounds(b).hashes.pop().unwrap();
         for _ in 0..500 {
             let row = sqlx::query!(
@@ -275,7 +280,7 @@ impl Fixture {
         panic!("write never landed");
     }
 
-    async fn rows(&self) -> i64 {
+    pub(super) async fn rows(&self) -> i64 {
         sqlx::query_scalar!(
             r#"SELECT count(*) AS "n!" FROM reference_cache_entries WHERE principal_id = $1"#,
             self.principal
@@ -315,7 +320,7 @@ async fn a_fork_at_an_intermediate_boundary_is_a_byte_estimate(pool: sqlx::PgPoo
     let fork = body(&[SYSTEM, USER_1, ASSISTANT_1, USER_2_ALT]);
     let o = bounds(&original);
     let tpb = 2_000.0f32 / o.total_bytes() as f32;
-    let expected = (o.cumulative_bytes[2] as f64 * f64::from(tpb)).round() as i64;
+    let expected = (o.cumulative_bytes[2] as f64 * f64::from(tpb)).round() as u64;
     assert_eq!(f.complete(&fork, 2_100, Utc::now()).await, Some(expected));
 }
 
@@ -349,14 +354,15 @@ async fn a_stream_is_visible_from_its_first_token(pool: sqlx::PgPool) {
     let a_arrival = Utc::now();
 
     assert_eq!(f.rows().await, 0);
-    f.cache.observe_first_token(hash_api_key(&f.secret), a.clone());
+    f.cache
+        .observe_first_token(hash_api_key(&f.secret), MODEL.into(), MODEL.into(), a.clone());
     f.wait_for(&a, false).await;
 
     // In flight: A has produced its first token but not completed.
     let b = body(&[SYSTEM, USER_1, ASSISTANT_1, USER_2]);
     let bb = bounds(&b);
     let own_tpb = 1_500.0f32 / bb.total_bytes() as f32;
-    let expected = (bb.cumulative_bytes[1] as f64 * f64::from(own_tpb)).round() as i64;
+    let expected = (bb.cumulative_bytes[1] as f64 * f64::from(own_tpb)).round() as u64;
     assert_eq!(
         f.complete(&b, 1_500, Utc::now()).await,
         Some(expected),
@@ -384,180 +390,91 @@ async fn the_estimate_never_exceeds_prompt_tokens(pool: sqlx::PgPool) {
 }
 
 /// Outside the allowlist nothing is estimated or written; covered requests that cannot
-/// be estimated also record NULL.
+/// be estimated, or that fail, record NULL and write nothing.
 #[dwctl_test_macros::test]
 async fn uncovered_or_unusable_requests_record_null(pool: sqlx::PgPool) {
     let f = fixture(pool.clone(), false, 0).await;
     let a = body(&[SYSTEM, USER_1]);
-    f.cache.observe_first_token(hash_api_key(&f.secret), a.clone());
+    f.cache
+        .observe_first_token(hash_api_key(&f.secret), MODEL.into(), MODEL.into(), a.clone());
+    assert!(matches!(f.joined(&a).await, Joined::Uncovered));
     assert_eq!(f.complete(&a, 1_200, Utc::now()).await, None);
     assert_eq!(f.rows().await, 0);
 
     let f = fixture(pool, true, 0).await;
-    let call = |success: bool, prompt_tokens: i64, b: Bytes, path: &'static str| {
-        let cache = f.cache.clone();
-        let secret = f.secret.clone();
-        async move {
-            cache
-                .complete(Completion {
-                    path,
-                    success,
-                    api_key: Some(hash_api_key(&secret)),
-                    model: Some(MODEL),
-                    body: Some(&b),
-                    prompt_tokens,
-                    arrival: Utc::now(),
-                })
-                .await
-        }
-    };
-    assert_eq!(
-        call(false, 1_200, a.clone(), "/ai/v1/chat/completions").await,
-        None,
-        "failed request"
+    let not_json = f.joined(&Bytes::from_static(b"not json")).await;
+    assert!(
+        matches!(
+            not_json,
+            Joined::Unavailable {
+                outcome: "parse_error",
+                coverage: Some(_)
+            }
+        ),
+        "{not_json:?}"
     );
-    assert_eq!(call(true, 0, a.clone(), "/ai/v1/chat/completions").await, None, "no usage");
-    assert_eq!(
-        call(true, 10, Bytes::from_static(b"not json"), "/ai/v1/chat/completions").await,
-        None
-    );
-    assert_eq!(call(true, 1_200, a.clone(), "/ai/v1/embeddings").await, None, "not chat");
+    assert_eq!(not_json.estimate(10), None);
+
+    for (prompt_tokens, success, what) in [(Some(1_200), false, "failed request"), (None, true, "no usage")] {
+        let mut pending = f.cache.begin(hash_api_key(&f.secret), MODEL, MODEL, a.clone(), Utc::now());
+        assert_eq!(pending.join(Duration::from_secs(5)).await.estimate(1_200), Some(0), "{what}");
+        pending.finish(prompt_tokens, success);
+    }
+    // A request dropped before it finishes (a client disconnect) writes nothing either.
+    drop(f.cache.begin(hash_api_key(&f.secret), MODEL, MODEL, a.clone(), Utc::now()));
+    // Give a write that should not happen the chance to land.
+    tokio::time::sleep(Duration::from_millis(100)).await;
     assert_eq!(f.rows().await, 0, "none of them wrote entries");
 }
 
-// ===== Wiring =====
-
-/// The layer makes a streamed request visible once output starts, while the stream is
-/// still open and without touching it; a non-streaming response writes nothing then.
+/// Terms cover their principal on their model even when it is not in `orgs`, and the
+/// join hands them on with the estimate.
 #[dwctl_test_macros::test]
-async fn the_layer_writes_at_the_first_streamed_chunk(pool: sqlx::PgPool) {
-    let f = fixture(pool, true, 0).await;
-    // The upstream stream stays open until the test sends its remaining chunks.
-    let (chunks_tx, chunks_rx) = futures::channel::mpsc::unbounded::<Result<Bytes, std::io::Error>>();
-    let chunks_rx = std::sync::Arc::new(std::sync::Mutex::new(Some(chunks_rx)));
-    let app = |stream: bool| {
-        let chunks_rx = chunks_rx.clone();
-        Router::new()
-            .route(
-                "/ai/v1/chat/completions",
-                post(move || async move {
-                    if stream {
-                        let rx = chunks_rx.lock().unwrap().take().expect("one streamed request");
-                        ([(axum::http::header::CONTENT_TYPE, "text/event-stream")], Body::from_stream(rx)).into_response()
-                    } else {
-                        axum::Json(serde_json::json!({"choices": []})).into_response()
-                    }
-                }),
-            )
-            .layer(axum::middleware::from_fn_with_state(
-                layer::ReferenceLayerState {
-                    cache: f.cache.clone(),
-                    body_limit: usize::MAX,
-                },
-                reference_cache_middleware,
-            ))
-    };
-    let request = |b: &Bytes| {
-        axum::http::Request::post("/ai/v1/chat/completions")
-            .header("authorization", format!("Bearer {}", f.secret))
-            .body(Body::from(b.clone()))
-            .unwrap()
-    };
+async fn assurance_terms_cover_their_principal(pool: sqlx::PgPool) {
+    let f = fixture_with(pool, false, 0, Some(CacheAssurance::GapShare(0.4))).await;
+    let a = body(&[SYSTEM, USER_1]);
+    let joined = f.joined(&a).await;
+    assert_eq!(joined.terms(), Some(CacheAssurance::GapShare(0.4)));
+    assert_eq!(joined.coverage().map(|c| c.principal), Some(f.principal));
+    assert_eq!(joined.estimate(1_000), Some(0));
 
-    let plain = body(&[SYSTEM, USER_2]);
-    let response = app(false).oneshot(request(&plain)).await.unwrap();
-    axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap();
-
-    assert_eq!(f.rows().await, 0, "a non-streaming response writes nothing in the layer");
-
-    let streamed = body(&[SYSTEM, USER_1]);
-    let response = app(true).oneshot(request(&streamed)).await.unwrap();
-    assert_eq!(response.status(), StatusCode::OK);
-    let mut forwarded = response.into_body().into_data_stream();
-    let send = |c: &'static str| chunks_tx.unbounded_send(Ok(Bytes::from_static(c.as_bytes()))).unwrap();
-
-    send(": keep-alive\n\n");
-    assert_eq!(forwarded.next().await.unwrap().unwrap(), ": keep-alive\n\n");
-    assert_eq!(f.rows().await, 0, "nothing before output starts");
-
-    send("data: {\"choices\":[{\"delta\":{\"content\":\"x\"}}]}\n\n");
-    assert!(forwarded.next().await.unwrap().unwrap().starts_with(b"data: {\"choices\""));
-    f.wait_for(&streamed, false).await;
-    assert_eq!(f.rows().await, 2, "the streamed request's two boundaries, while it is still open");
-
-    send("data: [DONE]\n\n");
-    drop(chunks_tx);
-    assert_eq!(forwarded.next().await.unwrap().unwrap(), "data: [DONE]\n\n");
-    assert!(forwarded.next().await.is_none());
+    let mut other = f
+        .cache
+        .begin(hash_api_key(&f.secret), "other-model", "other-model", a.clone(), Utc::now());
+    assert!(
+        matches!(other.join(Duration::from_secs(5)).await, Joined::Uncovered),
+        "terms name their model"
+    );
 }
 
-/// The analytics handler puts the estimate on the record it publishes, and counts an
-/// internal credential as the key it was minted for.
+/// A lookup that misses the join deadline bills nothing from the reference, but carries
+/// on: the request's entries are still written once it finishes.
 #[dwctl_test_macros::test]
-async fn the_analytics_record_carries_the_estimate(pool: sqlx::PgPool) {
-    let f = fixture(pool, true, 0).await;
-    let internal_auth = InternalAuthState {
-        credentials: InternalCredentials::generate(),
-        targets: Default::default(),
-    };
-    internal_auth
-        .targets
-        .key_ids
-        .insert(f.key_id.to_string(), onwards::auth::KeyHash::of(&f.secret));
-    let internal_token = internal_auth.credentials.mint(f.key_id, Duration::from_secs(60));
-    let (tx, mut rx) = mpsc::channel::<RawAnalyticsRecord>(8);
-    let handler = AnalyticsHandler::new(
-        AnalyticsOutboxWriter::for_test(tx),
-        Uuid::new_v4(),
-        crate::config::Config::default(),
-    )
-    .with_reference_cache(f.cache.clone(), internal_auth);
-
-    let send = |b: Bytes, prompt_tokens: i64, bearer: &str| {
-        let request = RequestData {
-            correlation_id: 1,
-            timestamp: std::time::SystemTime::now(),
-            method: Method::POST,
-            uri: Uri::from_static("/ai/v1/chat/completions"),
-            headers: [
-                ("authorization".to_string(), vec![Bytes::from(format!("Bearer {bearer}"))]),
-                ("content-type".to_string(), vec![Bytes::from_static(b"application/json")]),
-            ]
-            .into_iter()
-            .collect(),
-            body: Some(b),
-            trace_id: None,
-            span_id: None,
-        };
-        let completion = serde_json::json!({
-            "id": "chatcmpl-1", "object": "chat.completion", "created": 1, "model": MODEL,
-            "choices": [{"index": 0, "message": {"role": "assistant", "content": "ok"}, "finish_reason": "stop"}],
-            "usage": {"prompt_tokens": prompt_tokens, "completion_tokens": 2, "total_tokens": prompt_tokens + 2}
-        });
-        let response = ResponseData {
-            extensions: Default::default(),
-            correlation_id: 1,
-            timestamp: std::time::SystemTime::now(),
-            status: StatusCode::OK,
-            headers: [("content-type".to_string(), vec![Bytes::from_static(b"application/json")])]
-                .into_iter()
-                .collect(),
-            body: Some(Bytes::from(serde_json::to_vec(&completion).unwrap())),
-            duration_to_first_byte: Duration::from_millis(10),
-            duration: Duration::from_millis(100),
-        };
-        handler.handle_response(request, response)
-    };
-
-    let turn_1 = body(&[SYSTEM, USER_1]);
-    send(turn_1.clone(), 1_200, &f.secret).await;
-    assert_eq!(rx.recv().await.unwrap().reference_cached_tokens, Some(0));
-    f.wait_for(&turn_1, true).await;
-
-    send(body(&[SYSTEM, USER_1, ASSISTANT_1, USER_2]), 1_500, &internal_token).await;
-    assert_eq!(
-        rx.recv().await.unwrap().reference_cached_tokens,
-        Some(1_200),
-        "the internal credential's turn continues its key's prefix"
-    );
+async fn a_late_lookup_records_null_but_still_writes(pool: sqlx::PgPool) {
+    let f = fixture_with(pool, false, 0, Some(CacheAssurance::GapShare(0.4))).await;
+    let a = body(&[SYSTEM, USER_1]);
+    // Hold the table so the lookup (which also slides expiries) cannot run; plain
+    // reads still can.
+    let mut blocker = f.pool.begin().await.unwrap();
+    sqlx::query("LOCK TABLE reference_cache_entries IN EXCLUSIVE MODE")
+        .execute(&mut *blocker)
+        .await
+        .unwrap();
+    let mut pending = f.cache.begin(hash_api_key(&f.secret), MODEL, MODEL, a.clone(), Utc::now());
+    let joined = pending.join(Duration::from_millis(50)).await.clone();
+    match &joined {
+        Joined::Unavailable { coverage, outcome } => {
+            assert_eq!(*outcome, "deadline_exceeded");
+            assert_eq!(
+                coverage.as_ref().and_then(|c| c.terms),
+                Some(CacheAssurance::GapShare(0.4)),
+                "the key resolved before the table wait, so the fallback is attributed"
+            );
+        }
+        other => panic!("expected a deadline miss, got {other:?}"),
+    }
+    assert_eq!(joined.estimate(1_200), None);
+    pending.finish(Some(1_200), true);
+    blocker.rollback().await.unwrap();
+    f.wait_for(&a, true).await;
 }

@@ -726,25 +726,32 @@ prefix_chain:
   models: null # null: every model; a non-empty list: exactly those aliases
   hmac_key: "" # 32 bytes, hex; from a secret as DWCTL_PREFIX_CHAIN__HMAC_KEY
 
-# Shadow reference-cache estimate: for chat completions from the listed principals,
-# records in http_analytics.reference_cached_tokens how many prompt tokens an ideal
-# per-principal prefix cache would have served. Observational only: nothing is billed
-# from it and the usage returned to the caller is unchanged. Requires enable_analytics.
+# Reference cache: for chat requests (Chat Completions, and Messages and Responses
+# after translation), estimates how many prompt tokens an ideal per-principal prefix
+# cache would have served, recorded in http_analytics.reference_cached_tokens. For
+# organisations with `cache_assurance` terms in the org overlay catalog, unmarked
+# requests are also billed from it (and told so in `cached_tokens`); everyone else is
+# billed as before. Runs in the cache layer: requires cache.enabled and enable_analytics.
 reference_cache:
   enabled: false
   # Sliding window: an entry expires this long after the last request that used it.
   ttl_secs: 300
-  # Billing principals (api_keys.user_id: the org id for org keys). Required when
-  # enabled. Env: DWCTL_REFERENCE_CACHE__ORGS="<uuid>,<uuid>"
+  # Billing principals (api_keys.user_id: the org id for org keys) to estimate for
+  # without billing from the estimate. Organisations with assurance terms are covered
+  # on those models without being listed. Env: DWCTL_REFERENCE_CACHE__ORGS="<uuid>,<uuid>"
   orgs: []
-  models: null # null: every model; a non-empty list: exactly those aliases
+  models: null # for `orgs`: null = every model; a non-empty list = exactly those aliases
   # Per-alias tokens subtracted from an exact match (chat-template tail). Default 0.
   template_allowance_tokens: {}
-  # Bound on the estimate in the analytics handler (past it the column is NULL) and on
-  # each entry write. Must be greater than 0.
+  # Bound on the lookup started at arrival and on each entry write. Must be > 0.
   estimate_timeout_ms: 2000
+  # How long the final usage frame (the whole response, when not streaming) may wait for
+  # a lookup still running. Past it the estimate is NULL and assured organisations are
+  # billed the engine's hit (dwctl_cache_assurance_fallbacks_total). Must be > 0.
+  join_deadline_ms: 50
   sweep_interval_secs: 60
-  # Connections of the main pool the estimate may hold at once, so it cannot starve it.
+  # Connections of the main pool the reference cache may hold at once, so it cannot
+  # starve it.
   max_connections: 4
 
 continuation:

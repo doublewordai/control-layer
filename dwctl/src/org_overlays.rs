@@ -120,6 +120,14 @@ pub struct OrgModelOverlay {
     /// changes the multipliers this organisation pays.
     #[serde(default)]
     pub cache_tariff: Option<CachePrices>,
+    /// Assured cache billing for this organisation on this model: an unmarked request
+    /// is billed as cached part of the gap between the engine's cache hit and the
+    /// reference-cache estimate (`reference_cache` must be enabled), and its response
+    /// reports that count. `{gap_share: α}` bills `engine + α·(reference − engine)`;
+    /// `{prompt_floor: X}` bills `min(reference, X·prompt_tokens)`; neither bills below
+    /// the engine's hit. Needs a cache tariff on the model to have any effect.
+    #[serde(default)]
+    pub cache_assurance: Option<crate::reference_cache::CacheAssurance>,
     /// Optional prices for one of the model's serving classes, falling back to
     /// the general deal.
     #[serde(default)]
@@ -133,6 +141,7 @@ impl OrgModelOverlay {
             || self.self_hosted_only.is_some()
             || !self.tariffs.is_empty()
             || self.cache_tariff.is_some()
+            || self.cache_assurance.is_some()
             || !self.class_pricing.is_empty()
     }
 }
@@ -216,6 +225,9 @@ impl OrgCatalog {
                 validate_tariffs(&model.tariffs, &format!("{source}: model {:?}", model.alias))?;
                 if let Some(cache) = &model.cache_tariff {
                     validate_cache_tariff(&cache.as_tariff(), &format!("{source}: model {:?}", model.alias))?;
+                }
+                if let Some(assurance) = &model.cache_assurance {
+                    assurance.validate(&format!("{source}: model {:?}", model.alias))?;
                 }
                 for (class, prices) in &model.class_pricing {
                     ensure!(
@@ -337,24 +349,33 @@ async fn apply_in(db: &mut PgConnection, catalog: &OrgCatalog) -> Result<()> {
                     })?;
             }
             sqlx::query(
-                r#"INSERT INTO model_overlays (user_id, deployed_model_id, default_serving_class, targets, self_hosted_only, provisioning_source)
-                   VALUES ($1, $2, NULL, $3, $4, $5)
+                r#"INSERT INTO model_overlays (user_id, deployed_model_id, default_serving_class, targets, self_hosted_only, provisioning_source, cache_assurance)
+                   VALUES ($1, $2, NULL, $3, $4, $5, $6)
                    ON CONFLICT (user_id, deployed_model_id) DO UPDATE SET
                        default_serving_class = EXCLUDED.default_serving_class,
                        targets = EXCLUDED.targets,
                        self_hosted_only = EXCLUDED.self_hosted_only,
                        provisioning_source = EXCLUDED.provisioning_source,
+                       cache_assurance = EXCLUDED.cache_assurance,
                        updated_at = NOW()
                    WHERE model_overlays.default_serving_class IS DISTINCT FROM EXCLUDED.default_serving_class
                       OR model_overlays.targets IS DISTINCT FROM EXCLUDED.targets
                       OR model_overlays.self_hosted_only IS DISTINCT FROM EXCLUDED.self_hosted_only
-                      OR model_overlays.provisioning_source IS DISTINCT FROM EXCLUDED.provisioning_source"#,
+                      OR model_overlays.provisioning_source IS DISTINCT FROM EXCLUDED.provisioning_source
+                      OR model_overlays.cache_assurance IS DISTINCT FROM EXCLUDED.cache_assurance"#,
             )
             .bind(org_id)
             .bind(model_id)
             .bind(model.targets.map(serde_json::to_value).transpose().context("serialize overlay targets")?)
             .bind(model.self_hosted_only)
             .bind(&source)
+            .bind(
+                model
+                    .cache_assurance
+                    .map(serde_json::to_value)
+                    .transpose()
+                    .context("serialize overlay cache assurance")?,
+            )
             .execute(&mut *db)
             .await
             .with_context(|| format!("upsert overlay for org {:?} on {:?}", entry.document.org, model.alias))?;
@@ -1127,6 +1148,67 @@ models:
             .unwrap();
         assert_eq!(prices, 1);
         apply(&pool, &catalog).await.unwrap();
+    }
+
+    #[test]
+    fn cache_assurance_terms_are_validated() {
+        let directory = tempdir().unwrap();
+        for (terms, error) in [
+            ("{gap_share: 1.5}", "between 0 and 1"),
+            ("{gap_share: 0.4, prompt_floor: 0.9}", "exactly one"),
+            ("{alpha: 0.4}", "unknown field"),
+        ] {
+            write(
+                directory.path(),
+                "acme.yaml",
+                &format!("org: acme\nmodels:\n  - alias: m\n    cache_assurance: {terms}\n"),
+            );
+            let err = format!("{:#}", OrgCatalog::load(directory.path()).unwrap_err());
+            assert!(err.contains(error), "{terms}: {err}");
+        }
+        write(
+            directory.path(),
+            "acme.yaml",
+            "org: acme\nmodels:\n  - alias: m\n    cache_assurance: {prompt_floor: 0.9}\n",
+        );
+        let catalog = OrgCatalog::load(directory.path()).unwrap();
+        assert_eq!(
+            catalog.orgs[0].document.models[0].cache_assurance,
+            Some(crate::reference_cache::CacheAssurance::PromptFloor(0.9)),
+            "terms alone are an override"
+        );
+    }
+
+    /// Terms are written to the overlay row, read back by the cache layer's book, and
+    /// removed when the file drops them.
+    #[dwctl_test_macros::test]
+    async fn cache_assurance_terms_reach_the_assurance_book(pool: PgPool) {
+        use crate::reference_cache::{AssuranceBook, CacheAssurance};
+        let (org, _) = review_org_model(&pool).await;
+        let directory = tempdir().unwrap();
+        let apply_with = |terms: &'static str| {
+            write(
+                directory.path(),
+                "org.yaml",
+                &format!("org: review-org\nmodels:\n  - alias: review-model\n    self_hosted_only: false\n{terms}"),
+            );
+            OrgCatalog::load(directory.path()).unwrap()
+        };
+        let book = AssuranceBook::new(sqlx_pool_router::DynPools::new(pool.clone()));
+
+        apply(&pool, &apply_with("    cache_assurance: {gap_share: 0.4}\n")).await.unwrap();
+        book.refresh().await.unwrap();
+        assert_eq!(book.terms(org, "review-model"), Some(CacheAssurance::GapShare(0.4)));
+        let stored: serde_json::Value = sqlx::query_scalar("SELECT cache_assurance FROM model_overlays WHERE user_id = $1")
+            .bind(org)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(stored, serde_json::json!({"gap_share": 0.4}));
+
+        apply(&pool, &apply_with("")).await.unwrap();
+        book.refresh().await.unwrap();
+        assert_eq!(book.terms(org, "review-model"), None, "dropped from the file, gone from billing");
     }
 
     #[dwctl_test_macros::test]
