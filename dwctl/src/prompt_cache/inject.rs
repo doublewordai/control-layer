@@ -178,6 +178,9 @@ pub fn strip_cache_control(body: &[u8], telemetry: &TelemetryPolicy) -> (Option<
         let is_streaming = obj.get("stream").and_then(Value::as_bool) == Some(true);
         if is_streaming {
             let opts = obj.entry("stream_options").or_insert_with(|| serde_json::json!({}));
+            if !opts.is_object() {
+                *opts = serde_json::json!({});
+            }
             if let Some(opts_obj) = opts.as_object_mut() {
                 let already = opts_obj.get("include_usage").and_then(Value::as_bool) == Some(true);
                 if !already {
@@ -778,6 +781,16 @@ mod tests {
         let (out, had_markers) = strip_cache_control(body.as_bytes(), &TelemetryPolicy::default());
         assert!(out.is_some(), "include_usage injected");
         assert!(!had_markers, "no markers present");
+    }
+
+    #[test]
+    fn strip_stream_replaces_non_object_stream_options() {
+        for stream_options in [Value::Null, serde_json::json!("x"), serde_json::json!([])] {
+            let body = serde_json::json!({"stream": true, "stream_options": stream_options, "messages": []}).to_string();
+            let (out, _) = strip_cache_control(body.as_bytes(), &TelemetryPolicy::default());
+            let v: Value = serde_json::from_slice(&out.expect("include_usage injected")).unwrap();
+            assert_eq!(v["stream_options"], serde_json::json!({"include_usage": true}));
+        }
     }
 
     #[test]

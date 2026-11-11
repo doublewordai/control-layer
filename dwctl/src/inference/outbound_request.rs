@@ -249,10 +249,13 @@ fn transform(bytes: &Bytes, force_stream: bool, stream_usage: bool) -> (Option<V
             obj.insert("stream".to_string(), Value::Bool(true));
             changed = true;
         }
-        // Ensure stream_options.include_usage = true. Only when stream_options is
-        // absent or already an object; a `null` (or otherwise non-object) value is
-        // left alone, matching the old transform's graceful skip.
+        // Ensure stream_options.include_usage = true. Billing reads the usage, so a
+        // missing or non-object value is replaced with a fresh object.
         let stream_options = obj.entry("stream_options").or_insert_with(|| Value::Object(Default::default()));
+        if !stream_options.is_object() {
+            *stream_options = Value::Object(Default::default());
+            changed = true;
+        }
         if let Some(so) = stream_options.as_object_mut()
             && so.get("include_usage").and_then(Value::as_bool) != Some(true)
         {
@@ -537,9 +540,12 @@ mod tests {
     }
 
     #[test]
-    fn null_stream_options_left_alone() {
-        let body = serde_json::json!({"model": "gpt-4", "messages": [], "stream": true, "stream_options": null});
-        assert!(run(&body, false).is_none());
+    fn non_object_stream_options_replaced() {
+        for stream_options in [serde_json::Value::Null, serde_json::json!("x"), serde_json::json!([]), serde_json::json!(false)] {
+            let body = serde_json::json!({"model": "gpt-4", "messages": [], "stream": true, "stream_options": stream_options});
+            let out = run(&body, false).expect("should transform");
+            assert_eq!(out["stream_options"], serde_json::json!({"include_usage": true}));
+        }
     }
     fn timeouts(first_chunk_ms: u64, chunk_ms: u64, body_ms: u64) -> StreamTimeouts {
         StreamTimeouts {
