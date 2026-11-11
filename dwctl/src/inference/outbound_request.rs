@@ -541,7 +541,12 @@ mod tests {
 
     #[test]
     fn non_object_stream_options_replaced() {
-        for stream_options in [serde_json::Value::Null, serde_json::json!("x"), serde_json::json!([]), serde_json::json!(false)] {
+        for stream_options in [
+            serde_json::Value::Null,
+            serde_json::json!("x"),
+            serde_json::json!([]),
+            serde_json::json!(false),
+        ] {
             let body = serde_json::json!({"model": "gpt-4", "messages": [], "stream": true, "stream_options": stream_options});
             let out = run(&body, false).expect("should transform");
             assert_eq!(out["stream_options"], serde_json::json!({"include_usage": true}));
