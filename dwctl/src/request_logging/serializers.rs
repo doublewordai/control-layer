@@ -183,7 +183,12 @@ pub struct UsageMetrics {
     /// through as an implicit discount on a tariffed model). `None` when the billed read
     /// is zero, when no cache layer touched the response, or for rows predating the
     /// column. From the `CacheBilling` response extension, like the token counts.
+    /// `"reference"` marks an assured read billed above the engine's hit.
     pub cache_read_source: Option<String>,
+    /// The reference-cache estimate the cache layer billed this request against
+    /// (`http_analytics.reference_cached_tokens`), from the same `CacheBilling` cell as
+    /// the billed read, so the two always agree. `None` when not covered or not estimated.
+    pub reference_cached_tokens: Option<i64>,
     /// Content-free request parameters read off the parsed request body.
     pub request_params: RequestParams,
     /// Serving class the request asked for (suffix > overlay default >
@@ -671,6 +676,7 @@ impl UsageMetrics {
                 .and_then(|s| s.onwards_model.clone()),
             engine_cached_tokens,
             cache_read_source: extract_cache_read_source(response_data),
+            reference_cached_tokens: extract_reference_cached_tokens(response_data),
             request_params,
             requested_serving_class: response_data
                 .extensions
@@ -777,6 +783,18 @@ pub(crate) fn extract_cache_read_source(response_data: &ResponseData) -> Option<
         .and_then(|capture| capture.get())
         .and_then(|billed| billed.read_source)
         .map(|source| source.as_str().to_string())
+}
+
+/// The reference-cache estimate the request was billed against, from the same
+/// `CacheBilling` cell as the billed read. `None` when the cache layer did not estimate
+/// the request; there is no body fallback.
+pub(crate) fn extract_reference_cached_tokens(response_data: &ResponseData) -> Option<i64> {
+    response_data
+        .extensions
+        .get::<CacheBilling>()
+        .and_then(|capture| capture.get())
+        .and_then(|billed| billed.reference)
+        .map(|tokens| i64::try_from(tokens).unwrap_or(i64::MAX))
 }
 
 /// The upstream's own cached-prompt count: `usage.prompt_tokens_details.cached_tokens`
@@ -1296,7 +1314,7 @@ impl From<&AiResponse> for TokenMetrics {
 mod tests {
     use super::{
         RequestParams, UsageMetrics, extract_cache_read_source, extract_cache_tokens, extract_engine_cached_tokens, extract_finish_reason,
-        parse_ai_request, parse_ai_response,
+        extract_reference_cached_tokens, parse_ai_request, parse_ai_response,
     };
     use crate::prompt_cache::{BilledCache, CacheBilling, CacheReadSource, CacheStats};
     use crate::request_logging::models::{AiRequest, AiResponse};
@@ -3152,6 +3170,7 @@ mod tests {
                     ..Default::default()
                 },
                 read_source: Some(CacheReadSource::Module),
+                reference: None,
             });
             let parsed = parse_ai_response(&request, &response).unwrap();
             let metrics = UsageMetrics::extract(
@@ -3188,20 +3207,27 @@ mod tests {
             "an unfilled cell must not trust provider counts"
         );
         assert_eq!(extract_cache_read_source(&response), None, "unfilled cell → no source");
+        assert_eq!(extract_reference_cached_tokens(&response), None, "unfilled cell → no estimate");
         capture.set(BilledCache {
             stats: CacheStats {
                 read: 10,
                 creation_1h: 20,
                 ..Default::default()
             },
-            read_source: Some(CacheReadSource::Engine),
+            read_source: Some(CacheReadSource::Reference),
+            reference: Some(12),
         });
         let captured = extract_cache_tokens(&response);
         assert_eq!((captured.read, captured.creation_1h), (10, 20));
         assert_eq!(
             extract_cache_read_source(&response).as_deref(),
-            Some("engine"),
+            Some("reference"),
             "read provenance rides the same cell as the counts"
+        );
+        assert_eq!(
+            extract_reference_cached_tokens(&response),
+            Some(12),
+            "so does the estimate the read was billed against"
         );
     }
 

@@ -162,6 +162,54 @@ A positive organization price on an otherwise free model requires credit for
 that account only; it does not restrict other accounts. Admission checks tariff
 existence without resolving effective purpose/window/class prices per key/model.
 
+## Assured cache billing
+
+An unmarked request (no `cache_control` markers, no `cacheBreakpoint`) on a
+cache-tariffed model is normally billed the cache hit the serving engine
+reports. When routing sends a conversation to a replica that does not hold its
+prefix, that hit is lower than a single, ideal cache would have achieved.
+`cache_assurance` bills part of that gap as cached for one organization on one
+model:
+
+```yaml
+org: example-org
+models:
+  - alias: example-chat
+    cache_assurance:
+      gap_share: 0.4      # engine + 0.4 × (reference − engine)
+```
+
+or, as a floor:
+
+```yaml
+    cache_assurance:
+      prompt_floor: 0.9   # min(reference, 0.9 × prompt_tokens)
+```
+
+`reference` is the reference-cache estimate: the longest prefix of the request
+the organization sent in the last five minutes (`reference_cache.ttl_secs`),
+visible from a previous request's first streamed token or its completion. The
+billed count is never below the engine's hit and never above `prompt_tokens`,
+and it is what the response reports in `cached_tokens` (and in
+`cache_read_input_tokens` on Messages, `input_tokens_details.cached_tokens` on
+Responses). Reads billed this way are priced with the read multiplier clamped
+to at most 1, like engine reads. Marked requests are unaffected: they stay on
+the explicit cache.
+
+This requires `reference_cache.enabled` (and so `cache.enabled` and
+`enable_analytics`). The terms take effect when the catalog is applied at
+startup and reach every replica within a minute. If the estimate is not ready
+when the response's usage is written (`reference_cache.join_deadline_ms`), the
+request is billed the engine's hit and counted in
+`dwctl_cache_assurance_fallbacks_total`.
+
+Internally, the difference stays visible per request: `engine_cached_tokens`
+keeps the engine's hit, `reference_cached_tokens` the estimate,
+`cache_read_input_tokens` the billed count, and `cache_read_source` is
+`reference` when the terms raised the bill above the engine's hit.
+`dwctl_cache_assurance_tokens_total{org,model,kind}` counts prompt, engine,
+reference and billed tokens per organization and model.
+
 ## Validation and rollout
 
 Run the validator from the same Control Layer release that will apply the files:

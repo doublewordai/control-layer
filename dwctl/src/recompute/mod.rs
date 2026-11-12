@@ -208,7 +208,17 @@ pub async fn recompute_corpus(
                 // reads zero — so overlay the live rule (engine-reported hit, capped to
                 // the prompt, no creations). Without this every implicit row recomputes
                 // to list price and reports a phantom overcharge.
-                if row.cache_read_source.as_deref() == Some(crate::prompt_cache::CacheReadSource::Engine.as_str())
+                // An assured row (`cache_read_source = 'reference'`) was billed from the
+                // reference-cache estimate at serving time, which no stored body can
+                // reproduce: keep its billed read (still capped to the prompt) and verify
+                // the dollars from it.
+                if row.cache_read_source.as_deref() == Some(crate::prompt_cache::CacheReadSource::Reference.as_str()) {
+                    usage.counts.cache_read = row.stored_cache_read.clamp(0, usage.counts.prompt);
+                    usage.counts.cache_creation_5m = 0;
+                    usage.counts.cache_creation_1h = 0;
+                    usage.counts.cache_creation_24h = 0;
+                    usage.cache_tier_inferred = false;
+                } else if row.cache_read_source.as_deref() == Some(crate::prompt_cache::CacheReadSource::Engine.as_str())
                     && let Some(engine) = extract_engine_cached_tokens(&resp)
                 {
                     // Replace, never merge: live implicit billing ignored any provider
@@ -335,8 +345,11 @@ pub async fn recompute_corpus(
             // not the module's index — the classifier correctly reconstructs a zero split
             // for its marker-less body, and comparing that against the stored engine read
             // would flag every healthy implicit row as a billing disagreement. The read
-            // was already validated against the body by the replay overlay above.
-            if row.cache_read_source.as_deref() == Some(crate::prompt_cache::CacheReadSource::Engine.as_str()) {
+            // was already validated against the body by the replay overlay above. An
+            // assured ('reference') row is implicit in the same way.
+            if row.cache_read_source.as_deref().is_some_and(|s| {
+                s == crate::prompt_cache::CacheReadSource::Engine.as_str() || s == crate::prompt_cache::CacheReadSource::Reference.as_str()
+            }) {
                 continue;
             }
 

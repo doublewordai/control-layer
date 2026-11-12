@@ -1906,19 +1906,39 @@ pub async fn build_router(
     let request_logging_enabled = state.outlet_db.is_some() && config.enable_request_logging;
     let analytics_enabled = config.enable_analytics;
 
-    // Shadow reference-cache estimate: one instance shared by the first-token hook (inside
-    // outlet, below) and the analytics handler that records the estimate.
-    let reference_cache = (config.reference_cache.enabled && analytics_writer.is_some()).then(|| {
-        tracing::info!(principals = config.reference_cache.orgs.len(), models = ?config.reference_cache.models, "Reference-cache estimate enabled");
-        Arc::new(crate::reference_cache::ReferenceCache::new(
+    // Reference cache: run by the prompt-cache layer (below), which estimates covered
+    // requests and bills organisations with cache-assurance terms from the estimate. The
+    // terms come from the org overlay catalog, applied to the database at startup.
+    let reference_cache = if config.reference_cache.enabled && config.cache.enabled && analytics_writer.is_some() {
+        let pool = sqlx_pool_router::DynPools::new(state.db.clone());
+        let assurance = Arc::new(crate::reference_cache::AssuranceBook::new(pool.clone()));
+        if let Err(e) = assurance.refresh().await {
+            crate::background_error!(
+                crate::metrics::errors::component::REFERENCE_CACHE,
+                "assurance_load",
+                Error,
+                error = %e,
+                "Failed to load cache-assurance terms; assured organisations bill from the engine until the next reload"
+            );
+        }
+        tracing::info!(
+            principals = config.reference_cache.orgs.len(),
+            models = ?config.reference_cache.models,
+            assured_pairs = assurance.len(),
+            "Reference cache enabled"
+        );
+        Some(Arc::new(crate::reference_cache::ReferenceCache::new(
             &config.reference_cache,
-            sqlx_pool_router::DynPools::new(state.db.clone()),
+            pool,
             crate::prompt_cache::TelemetryPolicy::from_config(
                 config.cache.telemetry_blocks.strip_from_prompt,
                 &config.cache.telemetry_blocks.prefixes,
             ),
-        ))
-    });
+            assurance,
+        )))
+    } else {
+        None
+    };
 
     let outlet_layer = if request_logging_enabled || analytics_enabled || prefix_chain.is_some() {
         // Store the metrics recorder in state (created earlier in Application::new)
@@ -1960,10 +1980,7 @@ pub async fn build_router(
             // parse (the same value request logging stores), via `TokenMetrics::from`.
             // The outlet sits outer to translation, so it captures the foreign
             // response body; `AiResponse` covers each protocol's own shape.
-            let mut analytics_handler = request_logging::AnalyticsHandler::new(writer, instance_id, config.as_ref().clone());
-            if let Some(cache) = &reference_cache {
-                analytics_handler = analytics_handler.with_reference_cache(cache.clone(), state.internal_auth_state());
-            }
+            let analytics_handler = request_logging::AnalyticsHandler::new(writer, instance_id, config.as_ref().clone());
             multi_handler = multi_handler.with(analytics_handler);
         }
 
@@ -2613,15 +2630,16 @@ pub async fn build_router(
                 n => usize::try_from(n).unwrap_or(usize::MAX),
             };
             tracing::info!("Cached-input pricing enabled - wiring cache layer into onwards stack");
-            onwards_router.layer(middleware::from_fn_with_state(
-                crate::prompt_cache::CacheLayerState::new(
-                    classifier,
-                    body_limit,
-                    std::time::Duration::from_secs(cfg.cache.classify_deadline_secs),
-                )
-                .with_sse_buffer_limit(cfg.onwards.sse_buffer_limit),
-                crate::prompt_cache::cache_middleware,
-            ))
+            let mut cache_state = crate::prompt_cache::CacheLayerState::new(
+                classifier,
+                body_limit,
+                std::time::Duration::from_secs(cfg.cache.classify_deadline_secs),
+            )
+            .with_sse_buffer_limit(cfg.onwards.sse_buffer_limit);
+            if let Some(reference) = &reference_cache {
+                cache_state = cache_state.with_reference_cache(reference.clone());
+            }
+            onwards_router.layer(middleware::from_fn_with_state(cache_state, crate::prompt_cache::cache_middleware))
         } else {
             onwards_router
         }
@@ -2683,24 +2701,7 @@ pub async fn build_router(
     // (`x-onwards-response-id` / `x-fusillade-request-id`) are already set.
     // Stream completion sits just inside outlet, so it tracks the body outlet
     // hands to the client and can tell a disconnect from an early end.
-    //
-    // The reference-cache hook sits inside outlet too, so it hashes the request exactly as
-    // outlet captures it for the estimate, and sees the first chunk of the stream outlet
-    // forwards.
     let onwards_router = if let Some(outlet_layer) = outlet_layer.clone() {
-        let onwards_router = match &reference_cache {
-            Some(cache) => onwards_router.layer(middleware::from_fn_with_state(
-                crate::reference_cache::layer::ReferenceLayerState {
-                    cache: cache.clone(),
-                    body_limit: match config.limits.requests.max_body_size {
-                        0 => usize::MAX,
-                        n => usize::try_from(n).unwrap_or(usize::MAX),
-                    },
-                },
-                crate::reference_cache::reference_cache_middleware,
-            )),
-            None => onwards_router,
-        };
         onwards_router
             .layer(middleware::from_fn(auth::internal_credential::carry_presented_key))
             .layer(middleware::from_fn(request_logging::stream_completion::track_stream_completion))

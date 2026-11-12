@@ -34,9 +34,20 @@
 //! paradigm per request, so a customer's cache numbers are always explainable from
 //! their own markers.
 //!
+//! **Assured billing**: with the reference cache enabled, the layer also starts that
+//! cache's lookup for a chat request at arrival ([`crate::reference_cache`]), joins it
+//! at the terminal usage frame with a tight deadline (`reference_cache.join_deadline_ms`)
+//! next to classify, and passes the estimate into the usage edit. An unarmed request from
+//! an organisation with cache-assurance terms is billed from it
+//! ([`crate::reference_cache::assurance`]); every covered request records it. The layer
+//! also makes a stream's prefixes visible at its first output and writes the completed
+//! request's entries, from the same translated Chat Completions body classify hashes, so
+//! Messages and Responses requests share entries with native chat ones.
+//!
 //! Placed **inner to outlet** in the stack so the analytics/billing capture sees the
 //! injected cache fields.
 
+use std::sync::Arc;
 use std::time::Duration;
 
 use axum::body::Body;
@@ -58,9 +69,10 @@ use super::metrics as cache_metrics;
 use super::parse::{ParseError, validate_markers};
 use super::query::{self, Inject, InvalidBreakpointValue};
 use super::sse::SseBufferedStream;
-use super::stats::{CacheBilling, CacheReadSource};
+use super::stats::{BilledCache, CacheBilling, CacheReadSource};
 use crate::inference::rejections;
 use crate::inference::serving_name::ServingName;
+use crate::reference_cache::{FirstTokenDetector, Joined, PendingReference, ReferenceCache};
 
 /// Bound on the index commit (off the response path). A slow/hung DB can't leak the
 /// spawned task or hold a pool connection indefinitely; a miss just drops the write
@@ -80,6 +92,9 @@ pub struct CacheLayerState {
     pub body_limit: usize,
     /// Pending SSE event bytes, shared with the core proxy's configured limit.
     pub sse_buffer_limit: usize,
+    /// The reference cache, when `reference_cache.enabled`: estimated for covered
+    /// requests, and billed from for organisations with assurance terms.
+    pub reference: Option<Arc<ReferenceCache>>,
 }
 
 impl CacheLayerState {
@@ -94,11 +109,17 @@ impl CacheLayerState {
             deadline,
             body_limit,
             sse_buffer_limit: onwards::sse::DEFAULT_SSE_BUFFER_LIMIT,
+            reference: None,
         }
     }
 
     pub fn with_sse_buffer_limit(mut self, limit: usize) -> Self {
         self.sse_buffer_limit = limit;
+        self
+    }
+
+    pub fn with_reference_cache(mut self, reference: Arc<ReferenceCache>) -> Self {
+        self.reference = Some(reference);
         self
     }
 }
@@ -196,6 +217,8 @@ pub async fn cache_middleware(State(state): State<CacheLayerState>, request: Req
     if !is_cacheable(&request) {
         return next.run(request).await;
     }
+    // The reference cache matches only entries visible by now.
+    let arrival = chrono::Utc::now();
 
     let (mut parts, body) = request.into_parts();
     // Bounded by the same limit onwards enforces (never more restrictive than the entry).
@@ -318,6 +341,18 @@ pub async fn cache_middleware(State(state): State<CacheLayerState>, request: Req
     // into the classify task below; empty only for a body with no `model` field.
     let model_label = virtual_model.clone().unwrap_or_default();
 
+    // The reference lookup, alongside classify and from the same body: chat routes only
+    // (that is where prompts have blocks), keyed like classify's scope by the name as
+    // requested. It never delays forwarding.
+    let reference = match (&state.reference, api_key, virtual_model.as_deref()) {
+        (Some(cache), Some(key), Some(requested)) if chat_route => {
+            let model = ServingName::of(&parts.extensions, requested).model;
+            Some(cache.begin(key, requested, &model, body_bytes.clone(), arrival))
+        }
+        _ => None,
+    };
+    let reference_deadline = state.reference.as_ref().map_or(Duration::ZERO, |r| r.join_deadline());
+
     // Fork classify, parallel with the upstream call. Owns its inputs so the task is
     // `'static`; this is the one body clone (a future parse-once refactor would remove it).
     let classify_handle = virtual_model.map(|requested| {
@@ -403,20 +438,40 @@ pub async fn cache_middleware(State(state): State<CacheLayerState>, request: Req
             cache_billing,
             had_markers,
             state.sse_buffer_limit,
+            reference,
+            reference_deadline,
         );
     }
 
-    let outcome = join_classify(&mut handle, state.deadline, &model_label).await;
+    let mut reference = reference;
+    let join_reference = async {
+        if let Some(r) = reference.as_mut() {
+            r.join(reference_deadline).await;
+        }
+    };
+    let (outcome, ()) = tokio::join!(join_classify(&mut handle, state.deadline, &model_label), join_reference);
     if !outcome.active {
         // Disabled model (or a degraded classify) → no injection, but the upstream's own cache
         // accounting must still be scrubbed: this module is the only writer of customer-visible
         // cache fields, and a provider-reported `cached_tokens` on a model we bill at full price
         // reads as a discount we didn't give.
-        return scrub_response_nonstreaming(response, &upstream_cached).await;
+        let response = scrub_response_nonstreaming(response, &upstream_cached).await;
+        let success = response.status().is_success();
+        record_scrubbed(reference.as_ref(), &upstream_cached, &cache_billing);
+        settle_reference(reference, &cache_billing, &upstream_cached, !had_markers, false, success);
+        return response;
     }
     // Passthrough gate: markers pick the paradigm — no markers means implicit.
     let allow_implicit = !had_markers;
-    let (response, billing_ok) = inject_into_response_nonstreaming(response, &outcome.stats, &upstream_cached, allow_implicit).await;
+    let (response, billing_ok) = inject_into_response_nonstreaming(
+        response,
+        &outcome.stats,
+        &upstream_cached,
+        allow_implicit,
+        reference.as_ref().and_then(PendingReference::joined),
+    )
+    .await;
+    settle_reference(reference, &cache_billing, &upstream_cached, allow_implicit, true, billing_ok);
     if !outcome.pending.is_empty() {
         if billing_ok {
             spawn_commit(state.classifier.clone(), outcome.pending);
@@ -428,6 +483,39 @@ pub async fn cache_middleware(State(state): State<CacheLayerState>, request: Req
         }
     }
     response
+}
+
+/// Record the reference estimate of a request whose usage was only scrubbed (no cache
+/// billing): the billing cell carries zero counts and the estimate.
+fn record_scrubbed(reference: Option<&PendingReference>, upstream: &UpstreamCachedTokens, cache_billing: &CacheBilling) {
+    let estimate = reference
+        .and_then(PendingReference::joined)
+        .zip(upstream.prompt_tokens())
+        .and_then(|(joined, prompt)| joined.estimate(prompt));
+    if let Some(estimate) = estimate {
+        cache_billing.set(BilledCache {
+            reference: Some(estimate),
+            ..Default::default()
+        });
+    }
+}
+
+/// A request's reference work is done: record what it was billed, then write its entries
+/// if it succeeded. `injected` is whether the layer billed the request's cache at all.
+fn settle_reference(
+    reference: Option<PendingReference>,
+    cache_billing: &CacheBilling,
+    upstream: &UpstreamCachedTokens,
+    unmarked: bool,
+    injected: bool,
+    success: bool,
+) {
+    let Some(reference) = reference else {
+        return;
+    };
+    let billed = cache_billing.get().unwrap_or_default();
+    reference.record(&billed, upstream.get(), upstream.prompt_tokens(), unmarked, injected);
+    reference.finish(upstream.prompt_tokens(), success);
 }
 
 /// Whether a response is a streaming (SSE) chat completion. Media types are case-insensitive and
@@ -563,6 +651,8 @@ fn defer_classify_into_stream(
     cache_billing: CacheBilling,
     had_markers: bool,
     sse_buffer_limit: usize,
+    reference: Option<PendingReference>,
+    reference_deadline: Duration,
 ) -> Response {
     let (parts, body) = response.into_parts();
     let status_ok = parts.status.is_success();
@@ -576,6 +666,9 @@ fn defer_classify_into_stream(
         // Aborts the classify task if the stream is dropped early (client disconnect) instead of
         // detaching it into an orphan; `take()` defuses it on the normal terminal-frame path.
         let mut handle = AbortOnDrop(Some(handle));
+        // Dropped with the stream on a disconnect, which aborts the lookup.
+        let mut reference = reference;
+        let mut first_output = FirstTokenDetector::default();
         let mut outcome: Option<ClassifyOutcome> = None;
         let mut edited = false;
         let mut saw_error = false;
@@ -591,19 +684,38 @@ fn defer_classify_into_stream(
                     continue;
                 }
             };
+            // The first output makes the request's prefixes visible to later requests.
+            if let Some(r) = reference.as_mut()
+                && first_output.observe(&chunk)
+            {
+                r.first_token();
+            }
             // Detect the billing signals on this chunk (no injection yet).
             let probe = scan_edit_sse(&chunk, UsageEdit::Probe);
             if let Some(v) = probe.upstream_cached_tokens {
                 upstream_cached.set(v);
+            }
+            if let Some(v) = probe.prompt_tokens {
+                upstream_cached.set_prompt_tokens(v);
             }
             saw_error |= probe.saw_error;
             // The terminal usage frame is the only place the stats are needed: resolve classify now
             // — the single blocking await, on the *last* frame, bounded by the deadline. Borrow the
             // handle from the guard (don't `take()` it) so a disconnect *during* this await still
             // drops the guard → abort + metrics; defuse it only once the join has completed.
+            // The reference lookup is joined here too, alongside classify, under its own
+            // tighter deadline.
             if probe.saw_usage && outcome.is_none() {
+                let join_reference = async {
+                    if let Some(r) = reference.as_mut() {
+                        r.join(reference_deadline).await;
+                    }
+                };
                 if let Some(h) = handle.as_mut() {
-                    outcome = Some(join_classify(h, deadline, &model_label).await);
+                    let (o, ()) = tokio::join!(join_classify(h, deadline, &model_label), join_reference);
+                    outcome = Some(o);
+                } else {
+                    join_reference.await;
                 }
                 handle.take();
             }
@@ -613,17 +725,22 @@ fn defer_classify_into_stream(
             // only writer of customer-visible cache fields, and a provider-reported
             // `cached_tokens` on a model we bill at full price reads as a discount we didn't give.
             let out = if !edited && probe.saw_usage {
+                let joined: Option<&Joined> = reference.as_ref().and_then(PendingReference::joined);
                 let scan = match outcome.as_ref() {
                     Some(o) if o.active => scan_edit_sse(
                         &chunk,
                         UsageEdit::Inject {
                             stats: &o.stats,
                             allow_implicit: !had_markers,
+                            reference: joined,
                         },
                     ),
                     // Inactive — and `None` can't happen (the classify join above runs on the
                     // first usage frame), so it degrades to the safe edit.
-                    _ => scan_edit_sse(&chunk, UsageEdit::Scrub),
+                    _ => {
+                        record_scrubbed(reference.as_ref(), &upstream_cached, &cache_billing);
+                        scan_edit_sse(&chunk, UsageEdit::Scrub)
+                    }
                 };
                 // Only mark done once it *actually* rewrote — a (rare) reserialize failure (or a
                 // scrub with nothing to remove) shouldn't disable editing a later usage frame.
@@ -654,6 +771,14 @@ fn defer_classify_into_stream(
                 }
             }
         };
+        settle_reference(
+            reference.take(),
+            &cache_billing,
+            &upstream_cached,
+            !had_markers,
+            outcome.active,
+            status_ok && !saw_error && saw_usage,
+        );
         if outcome.active && !outcome.pending.is_empty() {
             if status_ok && !saw_error && saw_usage {
                 // Off the response path: the client already has every frame; don't hold the

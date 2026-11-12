@@ -1,0 +1,32 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n            SELECT mo.user_id, dm.alias, mo.cache_assurance AS \"cache_assurance!\"\n            FROM model_overlays mo\n            JOIN deployed_models dm ON dm.id = mo.deployed_model_id\n            WHERE mo.cache_assurance IS NOT NULL AND dm.deleted = false\n            ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "user_id",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 1,
+        "name": "alias",
+        "type_info": "Varchar"
+      },
+      {
+        "ordinal": 2,
+        "name": "cache_assurance!",
+        "type_info": "Jsonb"
+      }
+    ],
+    "parameters": {
+      "Left": []
+    },
+    "nullable": [
+      false,
+      false,
+      true
+    ]
+  },
+  "hash": "a0f829edc519531825bfdba418ee0254cc10fcedf11cb96f4f171852ecd9f181"
+}
