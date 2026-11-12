@@ -1,5 +1,12 @@
 # Changelog
 
+## [17.1.2](https://github.com/doublewordai/control-layer/compare/v17.1.1...v17.1.2) (2026-11-12)
+
+
+### Bug Fixes
+
+* **inference:** apply per-key policy to Anthropic /v1/messages callers ([#2184](https://github.com/doublewordai/control-layer/issues/2184)) ([f13841a](https://github.com/doublewordai/control-layer/commit/f13841a00c56cc0122d7a32c5a2b6ce7e2001e93))
+
 ## [17.1.1](https://github.com/doublewordai/control-layer/compare/v17.1.0...v17.1.1) (2026-11-11)
 
 
