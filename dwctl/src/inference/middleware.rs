@@ -173,16 +173,13 @@ pub async fn inference_middleware<P: PoolProvider + Clone + Send + Sync + 'stati
 
     let scrubbed_scheduling = strip_scheduling_priority(&mut request_value);
 
-    // The bearer token is needed below for ZDR, modality and toleration
+    // The presented key is needed below for ZDR, modality and toleration
     // decisions. Read it now (it was earlier only parsed after the body was
     // re-serialised) so the tolerations can be applied to `request_value`
-    // before the bytes are rebuilt.
-    let api_key = parts
-        .headers
-        .get("authorization")
-        .and_then(|v| v.to_str().ok())
-        .and_then(|s| s.strip_prefix("Bearer "))
-        .map(|s| s.to_string());
+    // before the bytes are rebuilt. Anthropic clients authenticate with
+    // `x-api-key`, which the translator promotes to `Authorization` only after
+    // this middleware has run, so it is read here the same way.
+    let api_key = rejections::api_key(nested_path, &parts.headers).map(str::to_string);
     // The key the request presents, by hash: every lookup below identifies the
     // caller by this, so an internal credential resolves to the key it names.
     let key_hash = presented_key_hash(&parts.extensions, api_key.as_deref());

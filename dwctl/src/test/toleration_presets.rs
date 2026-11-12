@@ -189,6 +189,33 @@ impl Fixture {
             .unwrap()
     }
 
+    /// Post an Anthropic Messages request carrying a client-supplied toleration
+    /// and return the Chat Completions body the upstream actually received.
+    /// The account's preset must survive the Anthropic-to-Chat translation.
+    async fn post_messages(&self) -> Value {
+        let body = json!({
+            "model": "plain",
+            "max_tokens": 16,
+            "messages": [{"role": "user", "content": "hi"}],
+            "nvext": {"routing_constraints": {"tolerations": [{"operator": "Exists"}]}}
+        });
+        self.server
+            .post("/ai/v1/messages")
+            .add_header("x-api-key", &self.key)
+            .add_header("anthropic-version", "2023-06-01")
+            .json(&body)
+            .await
+            .assert_status_ok();
+        self.upstream
+            .received_requests()
+            .await
+            .unwrap()
+            .last()
+            .unwrap()
+            .body_json()
+            .unwrap()
+    }
+
     /// Upload a one-line batch file for this account and return the stored
     /// template body, which is what the daemon later dispatches upstream.
     async fn upload_batch(&self) -> Value {
@@ -326,6 +353,28 @@ async fn a_preset_account_carries_its_tolerations_on_responses_requests(pool: Pg
         body["nvext"]["routing_constraints"]["tolerations"],
         json!([{"key": "pool", "operator": "Equal", "value": "gpu"}]),
         "the preset survives Responses translation: {body}"
+    );
+}
+
+/// A pinned Anthropic `/messages` request keeps its tolerations through the
+/// Anthropic-to-Chat translation, and a Default account's client-supplied
+/// toleration is still stripped rather than carried across.
+#[dwctl_test_macros::test]
+async fn a_preset_account_carries_its_tolerations_on_messages_requests(pool: PgPool) {
+    let f = Fixture::new(&pool).await;
+
+    let body = f.post_messages().await;
+    assert!(
+        body["nvext"]["routing_constraints"]["tolerations"].is_null(),
+        "a Default account carries no tolerations: {body}"
+    );
+
+    f.set_preset(Some("no-overflow")).await;
+    let body = f.post_messages().await;
+    assert_eq!(
+        body["nvext"]["routing_constraints"]["tolerations"],
+        json!([]),
+        "the preset survives Anthropic translation: {body}"
     );
 }
 

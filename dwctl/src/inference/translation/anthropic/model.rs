@@ -61,6 +61,12 @@ pub struct MessagesRequest {
     /// to synthesize a breakpoint on the last block (and strips it before the upstream call).
     #[serde(default)]
     pub cache_control: Option<Value>,
+    /// dwctl routing extension, not part of the Anthropic API. The inference
+    /// middleware, which sits outside this translator, scrubs what a caller
+    /// may not set and writes the account's scheduling tolerations here, so
+    /// the translator must carry it onto the Chat Completions body.
+    #[serde(default)]
+    pub nvext: Option<Value>,
 }
 
 /// A single conversation message.

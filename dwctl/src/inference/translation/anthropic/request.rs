@@ -82,6 +82,14 @@ pub fn to_chat_completions(req: MessagesRequest, cache_enabled: bool) -> Result<
     {
         out.insert("cache_control".into(), cc.clone());
     }
+    // `nvext` carries the account's scheduling tolerations, which the inference
+    // middleware writes to the raw Anthropic body before this translator runs.
+    // The middleware has already removed what a caller may not set, so the
+    // object is forwarded as is. Dropping it would let a request from an
+    // account pinned to a toleration preset reach capacity the preset forbids.
+    if let Some(nvext) = req.nvext.filter(Value::is_object) {
+        out.insert("nvext".into(), nvext);
+    }
 
     // Caching disabled → the cache middleware that normally strips block-level markers before the
     // upstream call isn't in the stack (it and this translator gate on the same `cache.enabled`).

@@ -196,7 +196,7 @@ impl Scope {
 /// The API key the request presents: a bearer `Authorization`, or, on the
 /// routes the Anthropic translators claim and only when `Authorization` is
 /// absent, `x-api-key`.
-fn api_key<'a>(path: &str, headers: &'a HeaderMap) -> Option<&'a str> {
+pub(crate) fn api_key<'a>(path: &str, headers: &'a HeaderMap) -> Option<&'a str> {
     match headers.get(AUTHORIZATION) {
         Some(_) => bearer_token(headers),
         None if anthropic::accepts_x_api_key(path, headers) => headers.get("x-api-key")?.to_str().ok(),

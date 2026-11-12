@@ -155,6 +155,7 @@ const DECLARED_FIELDS: &[&str] = &[
     "messages",
     "model",
     "name",
+    "nvext",
     "output_config",
     "role",
     "service_tier",
@@ -345,6 +346,25 @@ mod tests {
         assert_eq!(msgs[0]["content"], "be brief");
         assert_eq!(msgs[1]["role"], "user");
         assert_eq!(msgs[1]["content"], "hello");
+    }
+
+    #[test]
+    fn nvext_is_carried_onto_the_chat_body() {
+        let nvext = json!({"routing_constraints": {"tolerations": []}});
+        let out = translate(json!({
+            "model": "claude-x",
+            "max_tokens": 100,
+            "messages": [ { "role": "user", "content": "hello" } ],
+            "nvext": nvext
+        }));
+        assert_eq!(out["nvext"], nvext);
+
+        let out = translate(json!({
+            "model": "claude-x",
+            "max_tokens": 100,
+            "messages": [ { "role": "user", "content": "hello" } ]
+        }));
+        assert!(out.get("nvext").is_none(), "no nvext is added when the request has none: {out}");
     }
 
     #[test]
