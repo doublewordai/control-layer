@@ -1,5 +1,39 @@
 # Changelog
 
+## [7.0.0](https://github.com/doublewordai/control-layer/compare/fusillade-core-v6.0.0...fusillade-core-v7.0.0) (2026-11-12)
+
+
+### ⚠ BREAKING CHANGES
+
+* **fusillade:** drop the plaintext API key columns (DW-1013) ([#2173](https://github.com/doublewordai/control-layer/issues/2173))
+
+### Features
+
+* **api-keys:** stop storing API key plaintext (DW-1012) ([#2172](https://github.com/doublewordai/control-layer/issues/2172)) ([dde6a1c](https://github.com/doublewordai/control-layer/commit/dde6a1cd608a96bb917a1007e15299e6e295cff8))
+* correlate requests end to end with x_request_id ([#1970](https://github.com/doublewordai/control-layer/issues/1970)) ([f61e00f](https://github.com/doublewordai/control-layer/commit/f61e00fe5c898b4bf3fda97eef2f34578e059c23))
+* **fusillade:** dispatch by API key id (DW-1010) ([#2156](https://github.com/doublewordai/control-layer/issues/2156)) ([1284778](https://github.com/doublewordai/control-layer/commit/12847787a11281babd5452ac4377ebf278397960))
+* **fusillade:** drop the plaintext API key columns (DW-1013) ([#2173](https://github.com/doublewordai/control-layer/issues/2173)) ([e3c4de0](https://github.com/doublewordai/control-layer/commit/e3c4de08db28366fdce9c04b42cf87d5abf40244))
+* **limits:** cap batch requests in flight per model in onwards ([#1924](https://github.com/doublewordai/control-layer/issues/1924)) ([834827d](https://github.com/doublewordai/control-layer/commit/834827dbc2b09604e9759f8b715eb85b3e2c1e22))
+* **retention:** retire content weeks on one creation-anchored clock (DW-992) ([#2115](https://github.com/doublewordai/control-layer/issues/2115)) ([1a57f82](https://github.com/doublewordai/control-layer/commit/1a57f8267bc34198ceaa87917965960e2d0f9a6e))
+
+
+### Bug Fixes
+
+* **batches:** scope per-request retry to its batch ([#1847](https://github.com/doublewordai/control-layer/issues/1847)) ([695112e](https://github.com/doublewordai/control-layer/commit/695112e9c932aec65a46a43681f360b717114b82))
+* **files:** return 404 when a file delete loses the race ([#1887](https://github.com/doublewordai/control-layer/issues/1887)) ([5d41b2a](https://github.com/doublewordai/control-layer/commit/5d41b2ad86fc776751850fe9f9df6b1ebf04fee6))
+* **fusillade:** fence reclaimed request ownership ([#1804](https://github.com/doublewordai/control-layer/issues/1804)) ([14a53f9](https://github.com/doublewordai/control-layer/commit/14a53f9cfe6efc02051467ec33f08b622c967a5e))
+* **fusillade:** keep batch API keys out of debug logs ([#2129](https://github.com/doublewordai/control-layer/issues/2129)) ([ecb1cd0](https://github.com/doublewordai/control-layer/commit/ecb1cd0a6895c9d11b65a1b62162e9a0ea82fb0e))
+* **fusillade:** stop daemon maintenance from stalling writes to files ([#1986](https://github.com/doublewordai/control-layer/issues/1986)) ([fc5b7f7](https://github.com/doublewordai/control-layer/commit/fc5b7f7f6b3e74c0a208243641307442ae0f9c5a))
+* **fusillade:** write terminal realtime responses directly to retained storage ([#1797](https://github.com/doublewordai/control-layer/issues/1797)) ([1e2adec](https://github.com/doublewordai/control-layer/commit/1e2adec40985a7ffc33b184278b59254326bdd3e))
+* make the unverified flex volume count cheap (route probes + cap) ([#2132](https://github.com/doublewordai/control-layer/issues/2132)) ([d531d95](https://github.com/doublewordai/control-layer/commit/d531d95dbb50861077524b031979ea3f27b7677d))
+* **telemetry:** redact credentials at the log and trace sinks ([#2130](https://github.com/doublewordai/control-layer/issues/2130)) ([5b3dcb1](https://github.com/doublewordai/control-layer/commit/5b3dcb18a170850f5abbd2f613e9e4ad8f86a0de))
+* write new request templates to generation two ([6c26427](https://github.com/doublewordai/control-layer/commit/6c264272d0f301f810e06af2a6a65531fc86880f))
+
+
+### Miscellaneous
+
+* **deps:** bump cmov from 0.5.3 to 0.5.4 ([#1228](https://github.com/doublewordai/control-layer/issues/1228)) ([4f328f6](https://github.com/doublewordai/control-layer/commit/4f328f616c9171216a63da9d308a1aaf28a69bed))
+
 ## [6.0.0](https://github.com/doublewordai/control-layer/compare/fusillade-core-v5.0.0...fusillade-core-v6.0.0) (2026-09-15)
 
 
