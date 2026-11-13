@@ -30,7 +30,7 @@ tokio = { version = "1.0", features = ["full"] }
 tokio-stream = { version = "0.1", features = ["sync"] }
 tokio-util = { version = "0.7", features = ["rt", "io"] }
 notify = "8.2.0"
-sqlx = { version = "0.8", features = [
+sqlx = { version = "0.9", features = [
   "runtime-tokio-rustls",
   "postgres",
   "uuid",
@@ -205,7 +205,7 @@ axum-test = { version = "18.4.1" }
 # Builds Stripe objects from JSON in tests; the async-stripe types deserialize
 # through miniserde unconditionally, serde only behind a feature.
 miniserde = "0.1"
-sqlx = { version = "0.8", features = [
+sqlx = { version = "0.9", features = [
   "postgres",
   "runtime-tokio-rustls",
   "uuid",
