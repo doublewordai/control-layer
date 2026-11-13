@@ -4530,7 +4530,7 @@ dependencies = [
  "opentelemetry",
  "opentelemetry-otlp",
  "opentelemetry_sdk",
- "rand 0.9.4",
+ "rand 0.10.3",
  "reqwest",
  "rstest",
  "serde",

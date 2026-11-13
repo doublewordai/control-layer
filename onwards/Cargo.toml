@@ -59,7 +59,7 @@ subtle = "2.6.1"
 axum-prometheus = "0.10.0"
 metrics = "0.24"
 governor = "0.10.1"
-rand = "0.9"
+rand = "0.10"
 sha2 = "0.11.0"
 uuid = { version = "1", features = ["v4"] }
 [dev-dependencies]
