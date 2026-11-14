@@ -61,6 +61,14 @@ if $watch; then
     exec cargo watch -s "$watch_command"
 fi
 
+# Compile against the committed .sqlx metadata so the build needs no database.
+# Tests still read DATABASE_URL when they run.
+offline_defaulted=false
+if [[ -z "${SQLX_OFFLINE+set}" ]]; then
+    export SQLX_OFFLINE=true
+    offline_defaulted=true
+fi
+
 defaults=()
 if $default_workspace; then defaults+=(--workspace); fi
 if $default_all_features; then defaults+=(--all-features); fi
@@ -71,6 +79,12 @@ if $coverage; then
         --fail-under-lines 60 --lcov --output-path lcov.info ${args[@]+"${args[@]}"} || status=$?
 else
     cargo nextest run ${defaults[@]+"${defaults[@]}"} ${args[@]+"${args[@]}"} || status=$?
+fi
+
+# 101 is nextest's exit code for a failed build.
+if $offline_defaulted && ((status == 101)); then
+    echo "test rust: the build ran with SQLX_OFFLINE=true. If it reports 'no cached data for this query'," >&2
+    echo "  run ./scripts/sqlx-prepare.sh against a migrated database, or set SQLX_OFFLINE=false." >&2
 fi
 
 # Nextest doesn't execute doctests. Keep these even if an integration test fails.

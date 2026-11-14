@@ -76,10 +76,16 @@ See [the migration explainer](../../../docs/schema-safe-migrations.md) and use
 ## Validate changes
 
 Use `#[sqlx::test]` and repository/API tests, including relevant dynamic filters,
-empty results, nulls, and read-after-write workflows. Refresh `.sqlx` metadata with
-`cargo sqlx prepare --workspace` against correctly migrated local databases;
-preserve per-crate database configuration. Run `just lint rust` and
-`just test rust` before pushing Rust changes.
+empty results, nulls, and read-after-write workflows. `just test rust` and
+`just lint rust` compile with `SQLX_OFFLINE=true`, so after changing a
+`query!`-family macro (in tests too) or a migration it reads, refresh `.sqlx`
+before the build: `./scripts/sqlx-prepare.sh`, which runs
+`cargo sqlx prepare --workspace -- --workspace --all-targets --all-features`,
+with `DATABASE_URL` set to a migrated database. Do not `touch` sources. An
+unchanged query is not re-verified offline after a schema change; the lint
+check and CI, which compile against the database, catch that. Run
+`just lint rust` and the tests for the code you changed before pushing Rust
+changes.
 
 Lint runs `scripts/check_query_projections.py`; reviewed exceptions live in
 `.github/fixtures/stable-query-projections.json`. This source guard is not a SQL

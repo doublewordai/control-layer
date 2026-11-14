@@ -62,7 +62,8 @@ CI's merge queue is the gate. When one test fails, rerun that test with `-E`,
 not the suite.
 
 On a machine shared by several agents or worktrees: do not `touch` sources to
-force a recompile (run `cargo sqlx prepare` for stale query metadata); do not
+force a recompile (run `./scripts/sqlx-prepare.sh` for stale query metadata;
+test builds are offline and need no per-branch database); do not
 bypass the build lock that `just test rust` and `just lint rust` take
 (`scripts/with-build-lock.sh`); cap cargo with `CARGO_BUILD_JOBS` or
 `[build] jobs` in an untracked `.cargo/config.toml`; never run `just db-setup`

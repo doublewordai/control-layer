@@ -12,7 +12,8 @@ ROOT = Path(__file__).resolve().parents[2]
 
 
 class RunnerTests(unittest.TestCase):
-    def run_runner(self, *args, fail=False, via_just=False, extra_env=None):
+    def run_runner(self, *args, fail=False, via_just=False, extra_env=None,
+                   script="scripts/test-rust.sh", expect_stderr=False):
         with tempfile.TemporaryDirectory() as directory:
             directory = Path(directory)
             log = directory / "calls.jsonl"
@@ -22,8 +23,14 @@ class RunnerTests(unittest.TestCase):
                 "import json, os, sys\n"
                 "with open(os.environ['RUNNER_TEST_LOG'], 'a') as log:\n"
                 "    log.write(json.dumps(sys.argv[1:]) + '\\n')\n"
+                "with open(os.environ['RUNNER_TEST_LOG'] + '.env', 'a') as log:\n"
+                "    log.write(json.dumps(os.environ.get('SQLX_OFFLINE')) + '\\n')\n"
                 "if os.environ.get('RUNNER_TEST_FAIL') and sys.argv[1:3] == ['nextest', 'run']:\n"
-                "    sys.exit(42)\n"
+                "    sys.exit(int(os.environ['RUNNER_TEST_FAIL']))\n"
+                "if sys.argv[1:3] == ['sqlx', 'prepare']:\n"
+                "    with open(os.environ['RUNNER_TEST_LOG']) as log:\n"
+                "        attempts = sum(json.loads(line)[:2] == ['sqlx', 'prepare'] for line in log)\n"
+                "    sys.exit(attempts <= int(os.environ.get('RUNNER_TEST_PREPARE_FAILURES', '0')))\n"
             )
             cargo.chmod(0o755)
             (directory / "cargo-watch").symlink_to(cargo)
@@ -44,14 +51,17 @@ class RunnerTests(unittest.TestCase):
             flock.chmod(0o755)
             env = dict(os.environ, PATH=f"{directory}:{os.environ['PATH']}", RUNNER_TEST_LOG=str(log),
                        RUNNER_TEST_FLOCK_LOG=str(flock_log), DW_BUILD_LOCK_FILE=str(directory / "build.lock"))
-            for name in ("CI", "DW_NO_BUILD_LOCK", "DW_BUILD_LOCK_HELD"):
+            for name in ("CI", "DW_NO_BUILD_LOCK", "DW_BUILD_LOCK_HELD", "SQLX_OFFLINE"):
                 env.pop(name, None)
             env.update(extra_env or {})
             if fail:
-                env["RUNNER_TEST_FAIL"] = "1"
-            command = ["just", "test", "rust"] if via_just else [str(ROOT / "scripts/test-rust.sh")]
+                env["RUNNER_TEST_FAIL"] = "42" if fail is True else str(fail)
+            command = ["just", "test", "rust"] if via_just else [str(ROOT / script)]
             result = subprocess.run([*command, *args], cwd=ROOT, env=env, capture_output=True, text=True)
-            self.assertFalse(result.stderr, result.stderr)
+            if not expect_stderr:
+                self.assertFalse(result.stderr, result.stderr)
+            self.stderr = result.stderr
+            self.sqlx_offline = [json.loads(line) for line in Path(f"{log}.env").read_text().splitlines()]
             self.lock_file = env["DW_BUILD_LOCK_FILE"]
             self.flock_calls = [json.loads(line) for line in flock_log.read_text().splitlines()]
             return result.returncode, [json.loads(line) for line in log.read_text().splitlines()]
@@ -139,6 +149,45 @@ class RunnerTests(unittest.TestCase):
     def test_watch_leaves_locking_to_each_inner_run(self):
         self.run_runner("--watch")
         self.assertEqual(self.flock_calls, [])
+
+    def test_builds_default_to_sqlx_offline(self):
+        self.run_runner()
+        self.assertEqual(self.sqlx_offline[1:], ["true", "true"])
+        for value in ("false", ""):
+            with self.subTest(value=value):
+                self.run_runner(extra_env={"SQLX_OFFLINE": value})
+                self.assertEqual(self.sqlx_offline[1:], [value, value])
+
+    def test_failed_offline_build_names_the_remedy(self):
+        status, _ = self.run_runner(fail=101, expect_stderr=True)
+        self.assertEqual(status, 101)
+        self.assertIn("./scripts/sqlx-prepare.sh", self.stderr)
+        # A test failure, or a build the caller took online, is not a metadata problem.
+        self.run_runner(fail=100)
+        self.run_runner(fail=101, extra_env={"SQLX_OFFLINE": "false"})
+
+    def test_sqlx_prepare_covers_every_target(self):
+        scope = ["--workspace", "--", "--workspace", "--all-targets", "--all-features"]
+        status, calls = self.run_runner(script="scripts/sqlx-prepare.sh", expect_stderr=True)
+        self.assertEqual(status, 0)
+        # Dependencies are compiled offline first so their queries are not recorded.
+        self.assertEqual(calls, [
+            ["check", "--workspace", "--all-targets", "--all-features", "--keep-going"],
+            ["sqlx", "prepare", *scope],
+        ])
+        self.assertEqual(self.sqlx_offline, ["true", None])
+        status, calls = self.run_runner("--check", script="scripts/sqlx-prepare.sh")
+        self.assertEqual(status, 0)
+        self.assertEqual(calls, [["sqlx", "prepare", "--check", *scope]])
+
+    def test_sqlx_prepare_check_retries_once(self):
+        for failures, expected in [(1, 0), (2, 1)]:
+            with self.subTest(failures=failures):
+                status, calls = self.run_runner(
+                    "--check", script="scripts/sqlx-prepare.sh", expect_stderr=True,
+                    extra_env={"RUNNER_TEST_PREPARE_FAILURES": str(failures)})
+                self.assertEqual(status, expected)
+                self.assertEqual(len(calls), 2)
 
     def test_just_without_target_dispatches_empty_default(self):
         # Execute the actual dispatch recipe, replacing only its downstream

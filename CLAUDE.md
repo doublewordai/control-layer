@@ -77,7 +77,11 @@ Handlers (API) → Repositories (db::handlers) → Models (db::models) → Postg
 - Schema uses PostgreSQL LISTEN/NOTIFY for real-time config updates
 - Advisory locks for leader election - leader election is used to choose who
 runs the probe service, and (configurably) the batch daemon
-- SQLx performs compile-time SQL validation (requires database connection during compilation)
+- SQLx validates SQL at compile time, against the database or, with
+  `SQLX_OFFLINE=true`, against the committed `.sqlx` metadata. `.sqlx` covers
+  every target, tests included. After changing a query (test-only queries
+  too) or a migration it reads, run `./scripts/sqlx-prepare.sh` with
+  `DATABASE_URL` set to a migrated database, then commit `.sqlx`
 
 ## Development Commands
 
@@ -103,7 +107,10 @@ just db-start
 just db-setup
 ```
 
-**Important**: Rust compilation requires a running PostgreSQL database due to SQLx's compile-time query verification.
+**Important**: `just test rust` and `just lint rust` compile offline against
+`.sqlx` (`SQLX_OFFLINE=true` unless you set it), so the build needs no
+database. Plain `cargo` commands verify queries against the database in
+`DATABASE_URL` unless you export `SQLX_OFFLINE=true`.
 
 ### Running Services
 
@@ -294,7 +301,7 @@ Role changes take effect immediately except for native auth JWT-based API access
 
 - GitHub Actions runs `just ci rust` and `just ci ts`
 - Rust CI requires Rust 1.88+ for SQLx compatibility
-- SQLx prepare checks ensure offline query metadata is up to date: `cargo sqlx prepare --check --workspace`
+- SQLx prepare checks ensure offline query metadata is up to date for all targets: `./scripts/sqlx-prepare.sh --check`
 - Frontend CI checks TypeScript compilation, linting, tests with coverage, and production build
 
 ## Docker Build
@@ -316,7 +323,7 @@ TAGS=v1.0.0 PLATFORMS=linux/amd64,linux/arm64 docker buildx bake --push
 - **Backend**: `cargo test` provides comprehensive API integration tests using `axum-test` to spin up the full API server and make ~real HTTP requests
 - **Frontend**: `pnpm test` in `dashboard/` runs Vitest unit tests for React components and utilities. Always scope queries using `within(container)` instead of `screen` to avoid querying multiple test instances in the DOM (see TypeScript/React Testing section for details)
 - Hurl and Playwright E2E tests exist but are currently minimal (not the main test suite)
-- All Rust tests require a running PostgreSQL database due to SQLx integration
+- All Rust tests require a running PostgreSQL database at run time (`DATABASE_URL`); compiling them does not
 - Test cleanup scripts in `scripts/` (drop-test-users.sh, drop-test-groups.sh) for Hurl tests
 - Tests run in parallel where possible for performance
 
@@ -493,7 +500,7 @@ changed any TS code.
 
 - Do not rerun the full suite to re-verify an unrelated fix.
 - Do not `touch` source files to force a recompile. If SQLx query metadata is
-  stale, run `cargo sqlx prepare`.
+  stale ("no cached data for this query"), run `./scripts/sqlx-prepare.sh`.
 - `just test rust`, `just test quick` and the heavy steps of `just lint rust` take a machine-wide
   build lock (`scripts/with-build-lock.sh`, needs `flock`) so one heavy job
   runs at a time. A "waiting for build lock" line means another job holds it;

@@ -668,6 +668,9 @@ lint target *args="":
             pnpm exec eslint . --max-warnings 0 {{args}}
             ;;
         rust)
+            # Clippy compiles against the committed .sqlx metadata; the prepare
+            # check below still verifies it against the database.
+            export SQLX_OFFLINE="${SQLX_OFFLINE-true}"
             echo "Checking Cargo.lock sync..."
             cargo metadata --locked > /dev/null
             echo "Running cargo fmt --check..."
@@ -699,7 +702,7 @@ lint target *args="":
             python3 -B scripts/tests/schema_migrations/test_projection_guard.py
             python3 -B scripts/check_query_projections.py
             echo "Checking SQLx prepared queries..."
-            ./scripts/with-build-lock.sh cargo sqlx prepare --check --workspace
+            ./scripts/with-build-lock.sh ./scripts/sqlx-prepare.sh --check
             python3 -B scripts/tests/test_rust_runner.py
             python3 -B scripts/tests/test_quick_runner.py
             echo "Checking local Rust workspace topology..."
