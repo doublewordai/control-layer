@@ -61,7 +61,8 @@ DW_TEST_TIMINGS=1 cargo nextest run -p dwctl -E 'test(test_name)' \
 
 The helper reports clone/fixture setup, body, and total time. Body time includes
 application startup; the `create_test_app_with_config` helper reports that
-separately when timing is enabled. Use `-j 1` for isolated measurements and the
+separately when timing is enabled, as a `test-app-startup` total and one
+`test-app-stage <name> <elapsed>` line per startup stage. Use `-j 1` for isolated measurements and the
 same concurrency for before/after suite comparisons. Do not compare a cold
 build against a warm run. Record compile/link time separately with
 `cargo nextest run --workspace --all-features --no-run`.
