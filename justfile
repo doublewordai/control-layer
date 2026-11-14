@@ -56,6 +56,11 @@ check:
 
     echo "✅ All required tools found!"
 
+    # Optional: serialises heavy cargo jobs across worktrees (scripts/with-build-lock.sh)
+    if ! command -v flock >/dev/null 2>&1; then
+        echo "⚠️  Optional: flock not found (macOS: brew install flock); the build lock is skipped without it"
+    fi
+
     echo "✅ Development setup complete!"
 
 
@@ -660,7 +665,7 @@ lint target *args="":
                 --package openai-reassembler \
                 --package dwctl-test-macros
             echo "Running cargo clippy..."
-            cargo clippy \
+            ./scripts/with-build-lock.sh cargo clippy \
                 --package dwctl \
                 --package fusillade \
                 --package fusillade-core \
@@ -680,7 +685,7 @@ lint target *args="":
             python3 -B scripts/tests/schema_migrations/test_projection_guard.py
             python3 -B scripts/check_query_projections.py
             echo "Checking SQLx prepared queries..."
-            cargo sqlx prepare --check --workspace
+            ./scripts/with-build-lock.sh cargo sqlx prepare --check --workspace
             python3 -B scripts/tests/test_rust_runner.py
             echo "Checking local Rust workspace topology..."
             bash .github/scripts/test-local-rust-workspace.sh

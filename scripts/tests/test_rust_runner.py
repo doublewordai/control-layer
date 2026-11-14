@@ -12,7 +12,7 @@ ROOT = Path(__file__).resolve().parents[2]
 
 
 class RunnerTests(unittest.TestCase):
-    def run_runner(self, *args, fail=False, via_just=False):
+    def run_runner(self, *args, fail=False, via_just=False, extra_env=None):
         with tempfile.TemporaryDirectory() as directory:
             directory = Path(directory)
             log = directory / "calls.jsonl"
@@ -27,12 +27,33 @@ class RunnerTests(unittest.TestCase):
             )
             cargo.chmod(0o755)
             (directory / "cargo-watch").symlink_to(cargo)
-            env = dict(os.environ, PATH=f"{directory}:{os.environ['PATH']}", RUNNER_TEST_LOG=str(log))
+            # A stand-in flock records its arguments and runs the command, so
+            # these tests neither need flock nor wait on a real build.
+            flock_log = directory / "flock.jsonl"
+            flock_log.touch()
+            flock = directory / "flock"
+            flock.write_text(
+                "#!/usr/bin/env python3\n"
+                "import json, os, sys\n"
+                "args = sys.argv[1:]\n"
+                "with open(os.environ['RUNNER_TEST_FLOCK_LOG'], 'a') as log:\n"
+                "    log.write(json.dumps(args) + '\\n')\n"
+                "command = args[args.index(os.environ['DW_BUILD_LOCK_FILE']) + 1:]\n"
+                "os.execvp(command[0], command)\n"
+            )
+            flock.chmod(0o755)
+            env = dict(os.environ, PATH=f"{directory}:{os.environ['PATH']}", RUNNER_TEST_LOG=str(log),
+                       RUNNER_TEST_FLOCK_LOG=str(flock_log), DW_BUILD_LOCK_FILE=str(directory / "build.lock"))
+            for name in ("CI", "DW_NO_BUILD_LOCK", "DW_BUILD_LOCK_HELD"):
+                env.pop(name, None)
+            env.update(extra_env or {})
             if fail:
                 env["RUNNER_TEST_FAIL"] = "1"
             command = ["just", "test", "rust"] if via_just else [str(ROOT / "scripts/test-rust.sh")]
             result = subprocess.run([*command, *args], cwd=ROOT, env=env, capture_output=True, text=True)
             self.assertFalse(result.stderr, result.stderr)
+            self.lock_file = env["DW_BUILD_LOCK_FILE"]
+            self.flock_calls = [json.loads(line) for line in flock_log.read_text().splitlines()]
             return result.returncode, [json.loads(line) for line in log.read_text().splitlines()]
 
     def test_full_suite_includes_doctests(self):
@@ -98,6 +119,26 @@ class RunnerTests(unittest.TestCase):
         for call in calls[1:]:
             self.assertEqual(call.count("--workspace"), 1)
             self.assertEqual(call.count("--all-features"), 1)
+
+    def test_one_build_lock_spans_tests_and_doctests(self):
+        _, calls = self.run_runner("-E", "test(foo) | test(bar)")
+        probe, held = self.flock_calls
+        self.assertEqual(probe, ["-n", self.lock_file, "true"])
+        self.assertEqual(held[:3], ["-o", "-w", "3600"])
+        self.assertEqual(held[-4:], [self.lock_file, "./scripts/test-rust.sh", "-E", "test(foo) | test(bar)"])
+        self.assertEqual([call[:2] for call in calls], [["nextest", "--version"], ["nextest", "run"], ["test", "--doc"]])
+
+    def test_build_lock_is_skipped_when_held_disabled_or_in_ci(self):
+        for extra_env in [{"DW_BUILD_LOCK_HELD": "1"}, {"DW_NO_BUILD_LOCK": "1"}, {"CI": "true"}]:
+            with self.subTest(extra_env=extra_env):
+                status, calls = self.run_runner(extra_env=extra_env)
+                self.assertEqual(status, 0)
+                self.assertEqual(self.flock_calls, [])
+                self.assertEqual([call[:2] for call in calls], [["nextest", "--version"], ["nextest", "run"], ["test", "--doc"]])
+
+    def test_watch_leaves_locking_to_each_inner_run(self):
+        self.run_runner("--watch")
+        self.assertEqual(self.flock_calls, [])
 
     def test_just_without_target_dispatches_empty_default(self):
         # Execute the actual dispatch recipe, replacing only its downstream

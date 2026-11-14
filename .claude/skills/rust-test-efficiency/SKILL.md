@@ -49,6 +49,21 @@ state and the eventual state. Avoid fixed sleeps, and keep real-clock waits
 only when elapsed time is the behavior under test. Do not use retries to hide
 test failures.
 
+While iterating, run `cargo check -p <crate>` and only the tests for the
+modules you touched, e.g. `just test rust -E 'test(/api::handlers::api_keys/)'`.
+Run `just lint rust` once before opening or updating a PR. Run the full
+`just test rust` at most once per PR, and only for changes to shared
+infrastructure (migrations, test harness, config, auth middleware); otherwise
+CI's merge queue is the gate. When one test fails, rerun that test with `-E`,
+not the suite.
+
+On a machine shared by several agents or worktrees: do not `touch` sources to
+force a recompile (run `cargo sqlx prepare` for stale query metadata); do not
+bypass the build lock that `just test rust` and `just lint rust` take
+(`scripts/with-build-lock.sh`); cap cargo with `CARGO_BUILD_JOBS` or
+`[build] jobs` in an untracked `.cargo/config.toml`; never run `just db-setup`
+or reset a shared Postgres.
+
 `just test rust` uses nextest and then runs doctests separately. Nextest filters
 apply to unit/integration tests; doctests still run for the selected packages.
 Slow tests are reported every ten seconds. For per-test durations, inspect

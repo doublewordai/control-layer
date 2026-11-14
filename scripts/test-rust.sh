@@ -2,6 +2,7 @@
 # Keep normal, watch, and coverage runs on the same runner and package selection.
 set -euo pipefail
 cd "$(dirname "${BASH_SOURCE[0]}")/.."
+original_args=("$@")
 
 watch=false
 coverage=false
@@ -33,6 +34,12 @@ while (($#)); do
         *) args+=("$1"); shift ;;
     esac
 done
+
+# One heavy job per machine: hold the build lock across the test run and the
+# doctest pass. Watch mode locks each inner run, not the idle watcher.
+if ! $watch && [[ -z "${DW_BUILD_LOCK_HELD:-}" ]]; then
+    exec ./scripts/with-build-lock.sh ./scripts/test-rust.sh ${original_args[@]+"${original_args[@]}"}
+fi
 
 if ! cargo nextest --version >/dev/null 2>&1; then
     echo "cargo-nextest is required: cargo install cargo-nextest --locked" >&2
