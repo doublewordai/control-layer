@@ -69,7 +69,7 @@ cd dashboard && npm test -- --run # Direct vitest execution
 just lint rust                    # Full lint (fmt + clippy + sqlx prepare check)
 cargo fmt --check                 # Check formatting only
 cargo clippy --workspace --all-features # Clippy only
-cargo sqlx prepare --check --workspace
+./scripts/sqlx-prepare.sh --check
 ```
 
 ### TypeScript
@@ -140,7 +140,7 @@ cd dwctl && sqlx migrate run
 **Never** run `sqlx migrate run --source ... --database-url ...` from root.
 
 ### SQLx prepared queries out of sync
-If queries change, regenerate the workspace cache with `cargo sqlx prepare --workspace` from the repository root.
+If queries change (test-only queries included), regenerate the workspace cache with `./scripts/sqlx-prepare.sh`.
 
 ## Configuration
 - Environment variables: Prefix with `DWCTL_`, use `__` for nested keys (e.g., `DWCTL_AUTH__NATIVE__ENABLED=false`)

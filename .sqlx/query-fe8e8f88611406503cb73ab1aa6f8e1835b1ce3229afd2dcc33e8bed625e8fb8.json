@@ -1,0 +1,14 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "UPDATE batches SET expires_at = NOW() + INTERVAL '2 hours' WHERE id = $1",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "fe8e8f88611406503cb73ab1aa6f8e1835b1ce3229afd2dcc33e8bed625e8fb8"
+}

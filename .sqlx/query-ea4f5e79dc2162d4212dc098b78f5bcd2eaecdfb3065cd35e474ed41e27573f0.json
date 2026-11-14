@@ -1,0 +1,40 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT location,\n                      (SELECT COUNT(*) FROM requests WHERE batch_id = $1) AS \"live!\",\n                      (SELECT COUNT(*) FROM batch_requests_archive WHERE batch_id = $1) AS \"archived!\",\n                      (SELECT COUNT(DISTINCT archive_bucket) FROM batch_requests_archive WHERE batch_id = $1) AS \"buckets!\"\n               FROM batches WHERE id = $1",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "location",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 1,
+        "name": "live!",
+        "type_info": "Int8"
+      },
+      {
+        "ordinal": 2,
+        "name": "archived!",
+        "type_info": "Int8"
+      },
+      {
+        "ordinal": 3,
+        "name": "buckets!",
+        "type_info": "Int8"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid"
+      ]
+    },
+    "nullable": [
+      false,
+      null,
+      null,
+      null
+    ]
+  },
+  "hash": "ea4f5e79dc2162d4212dc098b78f5bcd2eaecdfb3065cd35e474ed41e27573f0"
+}

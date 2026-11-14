@@ -1,0 +1,34 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT counts_frozen_at IS NOT NULL AS \"f!\", completed_requests, failed_requests\n               FROM batches WHERE id = $1",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "f!",
+        "type_info": "Bool"
+      },
+      {
+        "ordinal": 1,
+        "name": "completed_requests",
+        "type_info": "Int8"
+      },
+      {
+        "ordinal": 2,
+        "name": "failed_requests",
+        "type_info": "Int8"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid"
+      ]
+    },
+    "nullable": [
+      null,
+      false,
+      false
+    ]
+  },
+  "hash": "7cbeca82c259e6aa893d0c65a057f03242a75b21d0dfccf998b5fe814fb25284"
+}

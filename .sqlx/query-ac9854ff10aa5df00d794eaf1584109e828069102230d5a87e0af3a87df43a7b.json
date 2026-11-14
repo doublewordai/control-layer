@@ -1,0 +1,40 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n        SELECT column_name AS \"name!\",\n               ordinal_position::INT AS \"ordinal!\",\n               data_type AS \"data_type!\",\n               is_nullable AS \"is_nullable!\"\n        FROM information_schema.columns\n        WHERE table_name = $1\n          AND table_schema = current_schema()\n        ORDER BY ordinal_position\n        ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "name!",
+        "type_info": "Name"
+      },
+      {
+        "ordinal": 1,
+        "name": "ordinal!",
+        "type_info": "Int4"
+      },
+      {
+        "ordinal": 2,
+        "name": "data_type!",
+        "type_info": "Varchar"
+      },
+      {
+        "ordinal": 3,
+        "name": "is_nullable!",
+        "type_info": "Varchar"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Name"
+      ]
+    },
+    "nullable": [
+      true,
+      null,
+      true,
+      true
+    ]
+  },
+  "hash": "ac9854ff10aa5df00d794eaf1584109e828069102230d5a87e0af3a87df43a7b"
+}

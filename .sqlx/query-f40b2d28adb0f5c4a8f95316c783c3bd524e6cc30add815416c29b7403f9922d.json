@@ -1,0 +1,14 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "UPDATE requests SET state = 'canceled', canceled_at = NOW() - INTERVAL '5 minutes',\n             claimed_at = NULL WHERE batch_id = $1",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "f40b2d28adb0f5c4a8f95316c783c3bd524e6cc30add815416c29b7403f9922d"
+}

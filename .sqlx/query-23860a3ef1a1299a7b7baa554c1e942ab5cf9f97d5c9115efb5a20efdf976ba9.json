@@ -1,0 +1,14 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n            UPDATE requests\n            SET state = 'completed',\n                response_status = 200,\n                response_body = '{\"ok\":true}',\n                claimed_at = NOW(),\n                started_at = NOW(),\n                completed_at = NOW()\n            WHERE id = $1\n            ",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "23860a3ef1a1299a7b7baa554c1e942ab5cf9f97d5c9115efb5a20efdf976ba9"
+}

@@ -1,0 +1,14 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "UPDATE requests SET state = 'failed', failed_at = NOW(), error = 'boom' WHERE batch_id = $1",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "8a72e8cbec5c571f0164acfee3ddc83eacd9d0dad7aa9d783a4a54532acab390"
+}

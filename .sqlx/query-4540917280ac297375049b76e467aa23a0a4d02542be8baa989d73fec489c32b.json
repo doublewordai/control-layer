@@ -1,0 +1,14 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "UPDATE requests SET state = 'failed', failed_at = NOW(),\n             error = '{\"type\":\"non_retriable_http_status\",\"status\":500,\"body\":\"boom\"}'\n             WHERE batch_id = $1 AND state <> 'completed'",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "4540917280ac297375049b76e467aa23a0a4d02542be8baa989d73fec489c32b"
+}

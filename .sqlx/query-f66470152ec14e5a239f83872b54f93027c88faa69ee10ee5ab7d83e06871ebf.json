@@ -1,0 +1,15 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n            UPDATE requests\n            SET state = 'claimed',\n                daemon_id = $1,\n                claimed_at = NOW()\n            WHERE batch_id = $2 AND model = 'model-b'\n            ",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Uuid"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "f66470152ec14e5a239f83872b54f93027c88faa69ee10ee5ab7d83e06871ebf"
+}

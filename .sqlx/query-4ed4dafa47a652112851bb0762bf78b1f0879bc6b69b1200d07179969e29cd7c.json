@@ -1,0 +1,14 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n            UPDATE requests r SET state = 'completed', response_status = 200,\n                   response_body = '{\"n\":' || o.rn || '}',\n                   completed_at = NOW() - (10 - o.rn) * INTERVAL '1 second'\n            FROM (SELECT id, ROW_NUMBER() OVER (ORDER BY id) AS rn\n                  FROM requests WHERE batch_id = $1) o\n            WHERE r.id = o.id\n            ",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "4ed4dafa47a652112851bb0762bf78b1f0879bc6b69b1200d07179969e29cd7c"
+}

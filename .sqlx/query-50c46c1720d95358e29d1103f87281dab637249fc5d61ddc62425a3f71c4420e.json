@@ -1,0 +1,34 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n            SELECT custom_id,\n                   body_byte_size AS \"body_byte_size!\",\n                   octet_length(body) as actual_bytes\n            FROM request_templates_all\n            WHERE file_id = $1\n            ORDER BY line_number ASC\n            ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "custom_id",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 1,
+        "name": "body_byte_size!",
+        "type_info": "Int8"
+      },
+      {
+        "ordinal": 2,
+        "name": "actual_bytes",
+        "type_info": "Int4"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid"
+      ]
+    },
+    "nullable": [
+      true,
+      true,
+      null
+    ]
+  },
+  "hash": "50c46c1720d95358e29d1103f87281dab637249fc5d61ddc62425a3f71c4420e"
+}

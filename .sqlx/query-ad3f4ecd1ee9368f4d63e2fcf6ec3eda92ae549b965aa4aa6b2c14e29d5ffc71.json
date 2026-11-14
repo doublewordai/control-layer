@@ -1,0 +1,14 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n            UPDATE requests\n            SET state = 'processing',\n                daemon_id = gen_random_uuid(),\n                claimed_at = NOW(),\n                started_at = NOW()\n            WHERE id = $1\n            ",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "ad3f4ecd1ee9368f4d63e2fcf6ec3eda92ae549b965aa4aa6b2c14e29d5ffc71"
+}

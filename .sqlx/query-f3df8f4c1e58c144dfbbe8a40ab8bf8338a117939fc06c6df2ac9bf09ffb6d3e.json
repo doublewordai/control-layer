@@ -1,0 +1,28 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT size_finalized, purpose FROM files WHERE id = $1",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "size_finalized",
+        "type_info": "Bool"
+      },
+      {
+        "ordinal": 1,
+        "name": "purpose",
+        "type_info": "Text"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid"
+      ]
+    },
+    "nullable": [
+      false,
+      true
+    ]
+  },
+  "hash": "f3df8f4c1e58c144dfbbe8a40ab8bf8338a117939fc06c6df2ac9bf09ffb6d3e"
+}

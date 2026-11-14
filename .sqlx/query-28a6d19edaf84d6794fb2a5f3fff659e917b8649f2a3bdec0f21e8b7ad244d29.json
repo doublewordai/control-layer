@@ -1,0 +1,14 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n            UPDATE requests\n            SET state = 'claimed',\n                daemon_id = gen_random_uuid(),\n                claimed_at = NOW()\n            WHERE id = $1\n            ",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "28a6d19edaf84d6794fb2a5f3fff659e917b8649f2a3bdec0f21e8b7ad244d29"
+}

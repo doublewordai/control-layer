@@ -1,0 +1,22 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT count(*) as \"count!\" FROM requests r LEFT JOIN request_templates_all t ON t.id = r.template_id WHERE r.batch_id = $1 AND r.template_id IS NOT NULL AND t.id IS NULL",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "count!",
+        "type_info": "Int8"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid"
+      ]
+    },
+    "nullable": [
+      null
+    ]
+  },
+  "hash": "b292e1127a43d119de90d7304faa6a890d65b26d767229505d9824cf97d04ed7"
+}
