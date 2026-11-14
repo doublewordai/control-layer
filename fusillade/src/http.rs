@@ -9,7 +9,7 @@ use crate::request::RequestData;
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use opentelemetry::trace::TraceContextExt;
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock};
 use std::time::Duration;
 use tracing_opentelemetry::OpenTelemetrySpanExt;
 
@@ -73,7 +73,11 @@ pub trait HttpClient: Send + Sync + Clone {
 /// timeouts, which are sized for slow upstreams rather than slow uploads.
 #[derive(Clone)]
 pub struct ReqwestHttpClient {
-    client: reqwest::Client,
+    /// Built on the first request rather than at construction: building the
+    /// TLS configuration (the platform's certificate verifier in particular)
+    /// is the expensive part of a client, and a process that constructs a
+    /// daemon without ever dispatching should not pay for it.
+    client: Arc<LazyLock<reqwest::Client>>,
     first_chunk_timeout: Duration,
     chunk_timeout: Duration,
     body_timeout: Duration,
@@ -100,7 +104,7 @@ impl ReqwestHttpClient {
         body_timeout: Duration,
     ) -> Self {
         Self {
-            client: reqwest::Client::new(),
+            client: Arc::new(LazyLock::new(reqwest::Client::new)),
             first_chunk_timeout,
             chunk_timeout,
             body_timeout,
