@@ -323,7 +323,7 @@ TAGS=v1.0.0 PLATFORMS=linux/amd64,linux/arm64 docker buildx bake --push
 - **Backend**: `cargo test` provides comprehensive API integration tests using `axum-test` to spin up the full API server and make ~real HTTP requests
 - **Frontend**: `pnpm test` in `dashboard/` runs Vitest unit tests for React components and utilities. Always scope queries using `within(container)` instead of `screen` to avoid querying multiple test instances in the DOM (see TypeScript/React Testing section for details)
 - Hurl and Playwright E2E tests exist but are currently minimal (not the main test suite)
-- All Rust tests require a running PostgreSQL database at run time (`DATABASE_URL`); compiling them does not
+- All Rust tests require a running PostgreSQL database at run time (`DATABASE_URL`); compiling them through `just test rust` or with `SQLX_OFFLINE=true` does not
 - Test cleanup scripts in `scripts/` (drop-test-users.sh, drop-test-groups.sh) for Hurl tests
 - Tests run in parallel where possible for performance
 
