@@ -176,18 +176,20 @@ class RunnerTests(unittest.TestCase):
             ["sqlx", "prepare", *scope],
         ])
         self.assertEqual(self.sqlx_offline, ["true", None])
-        status, calls = self.run_runner("--check", script="scripts/sqlx-prepare.sh")
+        status, calls = self.run_runner("--check", script="scripts/sqlx-prepare.sh", expect_stderr=True)
         self.assertEqual(status, 0)
-        self.assertEqual(calls, [["sqlx", "prepare", "--check", *scope]])
+        self.assertEqual(calls, [
+            ["check", "--workspace", "--all-targets", "--all-features", "--keep-going"],
+            ["sqlx", "prepare", "--check", *scope],
+        ])
 
-    def test_sqlx_prepare_check_retries_once(self):
-        for failures, expected in [(1, 0), (2, 1)]:
-            with self.subTest(failures=failures):
-                status, calls = self.run_runner(
-                    "--check", script="scripts/sqlx-prepare.sh", expect_stderr=True,
-                    extra_env={"RUNNER_TEST_PREPARE_FAILURES": str(failures)})
-                self.assertEqual(status, expected)
-                self.assertEqual(len(calls), 2)
+    def test_sqlx_prepare_check_failure_names_the_remedy(self):
+        status, calls = self.run_runner(
+            "--check", script="scripts/sqlx-prepare.sh", expect_stderr=True,
+            extra_env={"RUNNER_TEST_PREPARE_FAILURES": "1"})
+        self.assertEqual(status, 1)
+        self.assertEqual(len(calls), 2)
+        self.assertIn("./scripts/sqlx-prepare.sh", self.stderr)
 
     def test_just_without_target_dispatches_empty_default(self):
         # Execute the actual dispatch recipe, replacing only its downstream
