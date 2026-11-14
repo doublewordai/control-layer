@@ -369,6 +369,13 @@ const S3_MAX_ATTEMPTS: u32 = 5;
 /// 503 instead of holding the upload open.
 const S3_OPERATION_TIMEOUT: Duration = Duration::from_secs(30);
 
+/// Bound on a single attempt within an S3 call. Without it one stalled
+/// attempt (a connection that accepts the request but never answers) spends
+/// the whole operation budget, so the call fails instead of retrying. Ten
+/// seconds leaves room for a retry inside [`S3_OPERATION_TIMEOUT`] and still
+/// carries the largest accepted image (20 MiB) at a modest 2 MiB/s.
+const S3_ATTEMPT_TIMEOUT: Duration = Duration::from_secs(10);
+
 /// S3-compatible object store backend (Cloudflare R2, MinIO, Backblaze B2,
 /// AWS S3) reached via a custom endpoint.
 ///
@@ -404,6 +411,31 @@ impl S3CompatStore {
         access_key_id: impl Into<String>,
         secret_access_key: impl Into<String>,
     ) -> Self {
+        Self::with_timeouts(
+            bucket,
+            endpoint_url,
+            region,
+            force_path_style,
+            access_key_id,
+            secret_access_key,
+            S3_ATTEMPT_TIMEOUT,
+            S3_OPERATION_TIMEOUT,
+        )
+    }
+
+    /// [`S3CompatStore::new`] with explicit per-attempt and per-operation
+    /// timeouts (tests use short ones).
+    #[allow(clippy::too_many_arguments)]
+    fn with_timeouts(
+        bucket: impl Into<String>,
+        endpoint_url: impl Into<String>,
+        region: impl Into<String>,
+        force_path_style: bool,
+        access_key_id: impl Into<String>,
+        secret_access_key: impl Into<String>,
+        attempt_timeout: Duration,
+        operation_timeout: Duration,
+    ) -> Self {
         let creds =
             aws_credential_types::Credentials::new(access_key_id.into(), secret_access_key.into(), None, None, "dwctl-image-normalizer");
         let endpoint = endpoint_url.into();
@@ -414,7 +446,12 @@ impl S3CompatStore {
             .force_path_style(force_path_style)
             .behavior_version(aws_sdk_s3::config::BehaviorVersion::latest())
             .retry_config(RetryConfig::standard().with_max_attempts(S3_MAX_ATTEMPTS))
-            .timeout_config(TimeoutConfig::builder().operation_timeout(S3_OPERATION_TIMEOUT).build())
+            .timeout_config(
+                TimeoutConfig::builder()
+                    .operation_attempt_timeout(attempt_timeout)
+                    .operation_timeout(operation_timeout)
+                    .build(),
+            )
             .build();
         Self {
             bucket: bucket.into(),
@@ -688,6 +725,62 @@ mod tests {
             "secret",
         );
         assert_eq!(s.bucket, "imgs");
+    }
+
+    /// A connection that accepts the PutObject but never answers must cost
+    /// one attempt, not the whole operation: the next attempt, on a fresh
+    /// connection, succeeds within the operation budget.
+    #[tokio::test]
+    async fn s3_put_retries_after_a_stalled_attempt() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let connections = Arc::new(AtomicUsize::new(0));
+        let seen = connections.clone();
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut socket, _)) = listener.accept().await else { return };
+                let n = seen.fetch_add(1, Ordering::SeqCst);
+                tokio::spawn(async move {
+                    // Read the request head and body (small in this test).
+                    let mut buf = vec![0u8; 64 * 1024];
+                    let _ = socket.read(&mut buf).await;
+                    if n == 0 {
+                        // First connection: hold it open and never respond.
+                        tokio::time::sleep(Duration::from_secs(60)).await;
+                    } else {
+                        let _ = socket
+                            .write_all(b"HTTP/1.1 200 OK\r\nETag: \"etag\"\r\nContent-Length: 0\r\n\r\n")
+                            .await;
+                    }
+                });
+            }
+        });
+
+        let store = S3CompatStore::with_timeouts(
+            "imgs",
+            format!("http://{addr}"),
+            "auto",
+            true,
+            "AKIDEXAMPLE",
+            "secret",
+            Duration::from_millis(300),
+            Duration::from_secs(10),
+        );
+        let started = std::time::Instant::now();
+        let stored = store
+            .put(tok(0xab), "image/png", Bytes::from_static(b"png-bytes"))
+            .await
+            .expect("put must succeed on the retry after the stalled attempt");
+        assert!(stored);
+        assert!(connections.load(Ordering::SeqCst) >= 2, "the retry must use a new connection");
+        assert!(
+            started.elapsed() < Duration::from_secs(10),
+            "a stalled attempt must not consume the whole operation budget"
+        );
     }
 
     #[test]
