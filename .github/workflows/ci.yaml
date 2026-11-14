@@ -317,6 +317,9 @@ jobs:
           - package: openai-reassembler
             runner: depot-ubuntu-24.04-8
             database: false
+          - package: dwctl-stripe
+            runner: depot-ubuntu-24.04-8
+            database: false
           - package: onwards
             runner: depot-ubuntu-24.04-8
             database: false

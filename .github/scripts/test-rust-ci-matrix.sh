@@ -60,7 +60,7 @@ require_text 'backend-crate-test:' 'define a per-crate test job'
 require_text 'name: ${{ matrix.package }} / test' 'scope every crate test check to its package'
 require_text 'fail-fast: false' 'allow every crate result to complete'
 
-for package in fusillade fusillade-core fusillade-arsenal onwards openai-reassembler; do
+for package in fusillade fusillade-core fusillade-arsenal onwards openai-reassembler dwctl-stripe; do
   require_text "- package: ${package}" "test ${package} in the matrix"
 done
 
@@ -122,7 +122,7 @@ dwctl_image_job="$(extract_job build)"
 crate_test_job="$(extract_job backend-crate-test)"
 changes_job="$(extract_job changes)"
 
-if grep -Fq -- '- package: dwctl' <<< "$crate_test_job"; then
+if grep -Eq -- '- package: dwctl$' <<< "$crate_test_job"; then
   echo "dwctl must run in its partition matrix, not the generic crate matrix" >&2
   exit 1
 fi
@@ -182,6 +182,7 @@ expected_check_names=(
   'fusillade-core / test'
   'fusillade-arsenal / test'
   'openai-reassembler / test'
+  'dwctl-stripe / test'
   'onwards / test'
   'workspace / rust lint'
   'workspace / rust gate'
@@ -202,6 +203,7 @@ while IFS= read -r name; do
         'fusillade-core / test'
         'fusillade-arsenal / test'
         'openai-reassembler / test'
+        'dwctl-stripe / test'
         'onwards / test'
       )
       ;;
