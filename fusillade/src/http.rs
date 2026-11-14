@@ -9,7 +9,7 @@ use crate::request::RequestData;
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use opentelemetry::trace::TraceContextExt;
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock};
 use std::time::Duration;
 use tracing_opentelemetry::OpenTelemetrySpanExt;
 
@@ -40,6 +40,12 @@ pub trait HttpClient: Send + Sync + Clone {
     /// - The request times out (either waiting for headers or between body chunks)
     /// - The URL is invalid
     async fn execute(&self, request: &RequestData, api_key: &str) -> Result<HttpResponse>;
+
+    /// Check that the client can send requests. The daemon calls this before
+    /// it claims any work, so a client that cannot be built stops startup.
+    fn ensure_ready(&self) -> Result<()> {
+        Ok(())
+    }
 }
 
 // ============================================================================
@@ -73,7 +79,12 @@ pub trait HttpClient: Send + Sync + Clone {
 /// timeouts, which are sized for slow upstreams rather than slow uploads.
 #[derive(Clone)]
 pub struct ReqwestHttpClient {
-    client: reqwest::Client,
+    /// Built when the daemon starts running (or on the first request) rather
+    /// than at construction: building the TLS configuration (the platform's
+    /// certificate verifier in particular) is the expensive part of a client,
+    /// and a process that constructs a daemon without running it should not
+    /// pay for it. A build failure is kept and returned, never a panic.
+    client: Arc<LazyLock<std::result::Result<reqwest::Client, String>>>,
     first_chunk_timeout: Duration,
     chunk_timeout: Duration,
     body_timeout: Duration,
@@ -93,6 +104,12 @@ pub(crate) const DEFAULT_UPLOAD_CHUNK_BYTES: usize = 64 * 1024;
 pub(crate) const DEFAULT_UPLOAD_STALL_POLL: Duration = Duration::from_millis(100);
 
 impl ReqwestHttpClient {
+    fn client(&self) -> Result<&reqwest::Client> {
+        (**self.client)
+            .as_ref()
+            .map_err(|e| anyhow::anyhow!("HTTP client could not be built: {e}").into())
+    }
+
     /// Create a new reqwest-based HTTP client with the given timeouts.
     pub fn new(
         first_chunk_timeout: Duration,
@@ -100,7 +117,11 @@ impl ReqwestHttpClient {
         body_timeout: Duration,
     ) -> Self {
         Self {
-            client: reqwest::Client::new(),
+            client: Arc::new(LazyLock::new(|| {
+                reqwest::Client::builder()
+                    .build()
+                    .map_err(|e| e.to_string())
+            })),
             first_chunk_timeout,
             chunk_timeout,
             body_timeout,
@@ -173,6 +194,10 @@ fn map_reqwest_error(error: reqwest::Error) -> crate::error::FusilladeError {
 
 #[async_trait]
 impl HttpClient for ReqwestHttpClient {
+    fn ensure_ready(&self) -> Result<()> {
+        self.client().map(|_| ())
+    }
+
     #[tracing::instrument(name = "fusillade.execute", skip(self, request, api_key), fields(
         otel.name = %format!("{} {}", request.method, request.path),
         x_request_id = tracing::field::Empty,
@@ -196,7 +221,7 @@ impl HttpClient for ReqwestHttpClient {
             "Executing HTTP request"
         );
 
-        let mut req = self.client.request(
+        let mut req = self.client()?.request(
             request.method.parse().map_err(|e| {
                 tracing::error!(method = %request.method, error = %e, "Invalid HTTP method");
                 anyhow::anyhow!("Invalid HTTP method '{}': {}", request.method, e)

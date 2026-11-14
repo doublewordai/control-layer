@@ -1,4 +1,5 @@
 //! Test utilities for integration testing
+use std::sync::Mutex;
 use std::time::Instant;
 
 use crate::config::{
@@ -256,16 +257,39 @@ pub async fn create_test_app_with_config(
     _enable_sync: bool,
 ) -> (TestServer, crate::BackgroundServices) {
     let start = Instant::now();
+    startup_stage_reset();
     let app = crate::Application::new_with_pool(config, Some(pool), None)
         .await
         .expect("Failed to create application");
 
+    // Convert to test server (sync is always enabled in new())
+    let server = app.into_test_server();
+    startup_stage("test-server");
     if std::env::var_os("DW_TEST_TIMINGS").is_some() {
         eprintln!("test-app-startup {:?}", start.elapsed());
     }
+    server
+}
 
-    // Convert to test server (sync is always enabled in new())
-    app.into_test_server()
+/// When the last startup stage ended; `None` unless `DW_TEST_TIMINGS` is set.
+static STAGE_CLOCK: Mutex<Option<Instant>> = Mutex::new(None);
+
+fn startup_stage_reset() {
+    if std::env::var_os("DW_TEST_TIMINGS").is_some() {
+        *STAGE_CLOCK.lock().unwrap() = Some(Instant::now());
+    }
+}
+
+/// Under `DW_TEST_TIMINGS`, report the time since the previous stage of the
+/// application startup begun by [`create_test_app_with_config`]. Stages are
+/// attributed process-wide, so read them from tests that start one app.
+pub(crate) fn startup_stage(name: &str) {
+    let mut clock = STAGE_CLOCK.lock().unwrap();
+    if let Some(previous) = *clock {
+        let now = Instant::now();
+        eprintln!("test-app-stage {name} {:?}", now - previous);
+        *clock = Some(now);
+    }
 }
 
 pub fn create_test_config() -> crate::config::Config {

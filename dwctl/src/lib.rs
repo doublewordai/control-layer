@@ -193,6 +193,15 @@ mod types;
 mod upload_compression;
 pub mod webhooks;
 
+/// Under `DW_TEST_TIMINGS`, attribute the startup time of a test application
+/// to the stage that just ended. Compiled out of non-test builds.
+macro_rules! startup_stage {
+    ($name:literal) => {
+        #[cfg(test)]
+        crate::test::utils::startup_stage($name);
+    };
+}
+
 // Test modules
 #[cfg(test)]
 mod test;
@@ -1425,6 +1434,7 @@ async fn setup_database(
             .expect("Failed to create TestDbPools");
         let replica_pool = test_pools.read().into_inner();
         migrations::at_startup(config.migrations.mode, &migrations::Target::main(), &existing_pool).await?;
+        startup_stage!("db.main");
         (None, db::PoolPair::unsplit(DbPools::with_replica(existing_pool, replica_pool)))
     } else {
         // Database connection - handle both embedded and external
@@ -1593,9 +1603,11 @@ async fn setup_database(
         None
     };
 
+    startup_stage!("db.fusillade");
     // Underway migrations (background task queue) — one transaction, but keep
     // them on the direct connection like every other migration.
     migrations::underway_at_startup(config.migrations.mode, &main.direct.write()).await?;
+    startup_stage!("db.underway");
 
     // Outlet request-logging pools, if enabled
     let outlet = if config.enable_request_logging {
@@ -1642,6 +1654,7 @@ async fn setup_database(
 
     // Seed database with initial configuration (only runs once)
     seed_database(&config.model_sources, &main.pooled.write()).await?;
+    startup_stage!("db.seed");
 
     if config.model_provisioning.enabled {
         // Every catalog is parsed and validated before any is applied, so
@@ -4708,6 +4721,7 @@ impl Application {
                 .with_retention_maintenance(retention_maintenance_config)
                 .with_leak_config(config.background_services.batch_daemon.leak.clone()),
         );
+        startup_stage!("app.fusillade-daemon");
         // Build the ZDR keystore once and share it across the response store, the
         // daemon processor, and background services (which install the response
         // transformer). A misconfiguration is fatal.
@@ -4774,6 +4788,7 @@ impl Application {
         })
         .await?;
 
+        startup_stage!("app.background-services");
         // Register onwards as a fusillade daemon so realtime requests get a valid daemon_id.
         let onwards_daemon_id = uuid::Uuid::new_v4();
         let fusillade_write_pool = sqlx_pool_router::DynPools::new(pools.fusillade.direct.clone());
@@ -4987,6 +5002,7 @@ impl Application {
         )
         .await?;
 
+        startup_stage!("app.router");
         Ok(Self {
             router,
             app_state,

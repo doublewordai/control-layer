@@ -2961,6 +2961,7 @@ where
     pub async fn run_with_mode(self: Arc<Self>, mode: DaemonMode) -> Result<()> {
         tracing::info!("Daemon starting main processing loop");
         self.validate_startup(mode)?;
+        self.http_client.ensure_ready()?;
 
         // Validate the configured claim topology before registering the daemon
         // or spawning any maintenance tasks. Background workers read this
