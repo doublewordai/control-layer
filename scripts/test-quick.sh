@@ -99,7 +99,9 @@ map_path() {
         dwctl/test-macros/*)
             dwctl_all=true; parts+="package(dwctl-test-macros)"$'\n' ;;
         dwctl/src/*) map_dwctl_src "${path#dwctl/src/}" ;;
-        dwctl/migrations/*|dwctl/underway-migrations/*) dwctl_test migrations ;;
+        # Integration binaries can embed the migrations themselves, so run them too.
+        dwctl/migrations/*|dwctl/underway-migrations/*)
+            dwctl_parts+="kind(test)"$'\n'; dwctl_test migrations ;;
         # Excluded by the default nextest profile, so a filter cannot select them.
         dwctl/tests/memory_budget/*) memory=true ;;
         dwctl/tests/*)

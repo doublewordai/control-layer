@@ -621,7 +621,9 @@ _test-other target="" *args="":
             ;;
         memory)
             echo "Running memory budget tests..."
-            cargo test --package dwctl --test memory_budget {{args}} -- --nocapture
+            # Through the runner: same build as 'just test rust' (no -p rebuild) and the build lock.
+            ./scripts/test-rust.sh --no-doctests --ignore-default-filter \
+                -E 'binary(memory_budget)' --no-capture {{args}}
             ;;
         *)
             echo "Usage: just test [docker|rust|quick|ts|memory]"

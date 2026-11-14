@@ -55,11 +55,13 @@ class MappingTests(unittest.TestCase):
         self.assertEqual(self.filterset("dwctl/src/sync/onwards_config/tests.rs"), dwctl(test("sync")))
 
     def test_migrations_select_the_migration_tests(self):
-        expected = dwctl(test("migrations"))
-        for path in ("dwctl/migrations/20260101000000_example.sql", "dwctl/src/migrations.rs",
-                     "dwctl/src/migrations/tariff_indexes_tests.rs", "dwctl/underway-migrations/1_example.sql"):
+        for path in ("dwctl/src/migrations.rs", "dwctl/src/migrations/tariff_indexes_tests.rs"):
             with self.subTest(path=path):
-                self.assertEqual(self.filterset(path), expected)
+                self.assertEqual(self.filterset(path), dwctl(test("migrations")))
+        # Migration files also reach the integration binaries that embed them.
+        for path in ("dwctl/migrations/20260101000000_example.sql", "dwctl/underway-migrations/1_example.sql"):
+            with self.subTest(path=path):
+                self.assertEqual(self.filterset(path), dwctl("kind(test)", test("migrations")))
         self.assertEqual(self.filterset("fusillade-arsenal/migrations/20260101000000_example.sql"),
                          f"package(dwctl) & {test('migrations')} | package(fusillade-arsenal)")
 
