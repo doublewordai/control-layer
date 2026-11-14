@@ -19,6 +19,18 @@ print_stdout = "deny"
 print_stderr = "deny"
 dbg_macro = "deny"
 
+# Local builds keep enough debuginfo for file:line in panics and backtraces
+# of workspace code, and none for dependencies. Full debuginfo made the target
+# directory about a third larger for no gain in the edit-test loop. To step
+# through dependencies in a debugger, build once with
+# `--config 'profile.dev.debug=2' --config 'profile.dev.package."*".debug=2'`.
+# `test` and `ci` inherit these; `ci` already builds without debuginfo.
+[profile.dev]
+debug = "line-tables-only"
+
+[profile.dev.package."*"]
+debug = false
+
 # Coverage builds compile the entire test suite as one very large crate. Full
 # debug info and incremental state make that clean build slower and produce
 # several gigabytes of artifacts, while neither is needed for CI coverage.
