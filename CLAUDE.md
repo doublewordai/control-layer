@@ -129,9 +129,10 @@ cargo run
 
 ```bash
 # Backend tests via nextest, followed by doctests (requires database).
-# While iterating, check the crate and run only the modules you touched:
+# While iterating, check the crate and run only the tests for what you changed:
 cargo check -p dwctl
-just test rust -E 'test(/api::handlers::api_keys/)'
+just test quick             # Tests mapped from the files changed since origin/main
+just test rust --no-doctests -E 'test(/api::handlers::api_keys/)'
 
 just test rust              # Full suite: slow; see "Local verification"
 just test rust --watch      # Watch mode
@@ -471,9 +472,14 @@ PUSH ANY CODE THAT DOESN'T PASS LINT AND THE TESTS FOR WHAT YOU CHANGED.
 
 Rust:
 
-- While iterating: `cargo check -p <crate>` and `just test rust -E '<filter>'`
-  for the modules you touched, e.g.
-  `just test rust -E 'test(/api::handlers::api_keys/)'`.
+- While iterating: `cargo check -p <crate>`, then `just test quick`. It maps
+  the files changed since `origin/main` to a nextest filterset and skips
+  doctests; `just test quick --print` shows the filterset, `--base <ref>`
+  changes the comparison. The mapping is a heuristic, so add
+  `just test rust --no-doctests -E '<filter>'` for anything else your change
+  reaches, e.g. `-E 'test(/api::handlers::api_keys/)'`.
+- Select tests with `-E 'package(<crate>) & ...'`, not `-p`: `-p` resolves a
+  different feature set and rebuilds the workspace.
 - Before opening or updating a PR: `just lint rust`, once.
 - Run the full `just test rust` at most once per PR, and only when the change
   touches shared infrastructure (migrations, test harness, config, auth
@@ -488,7 +494,7 @@ changed any TS code.
 - Do not rerun the full suite to re-verify an unrelated fix.
 - Do not `touch` source files to force a recompile. If SQLx query metadata is
   stale, run `cargo sqlx prepare`.
-- `just test rust` and the heavy steps of `just lint rust` take a machine-wide
+- `just test rust`, `just test quick` and the heavy steps of `just lint rust` take a machine-wide
   build lock (`scripts/with-build-lock.sh`, needs `flock`) so one heavy job
   runs at a time. A "waiting for build lock" line means another job holds it;
   wait, do not bypass it.

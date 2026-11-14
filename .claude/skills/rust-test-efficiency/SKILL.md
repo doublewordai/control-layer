@@ -49,8 +49,12 @@ state and the eventual state. Avoid fixed sleeps, and keep real-clock waits
 only when elapsed time is the behavior under test. Do not use retries to hide
 test failures.
 
-While iterating, run `cargo check -p <crate>` and only the tests for the
-modules you touched, e.g. `just test rust -E 'test(/api::handlers::api_keys/)'`.
+While iterating, run `cargo check -p <crate>` and then `just test quick`: it
+maps the files changed since `origin/main` to a nextest filterset
+(`--print` shows it) and skips doctests. Add
+`just test rust --no-doctests -E 'test(/api::handlers::api_keys/)'`-style runs
+for anything the mapping misses. Use `package(<crate>)` inside `-E`, not `-p`,
+which rebuilds for a different feature set.
 Run `just lint rust` once before opening or updating a PR. Run the full
 `just test rust` at most once per PR, and only for changes to shared
 infrastructure (migrations, test harness, config, auth middleware); otherwise
@@ -65,7 +69,10 @@ bypass the build lock that `just test rust` and `just lint rust` take
 or reset a shared Postgres.
 
 `just test rust` uses nextest and then runs doctests separately. Nextest filters
-apply to unit/integration tests; doctests still run for the selected packages.
+apply to unit/integration tests; doctests still run for the selected packages
+unless you pass `--no-doctests`. Local runs skip the memory-budget tests
+(`just test memory` runs them; CI uses the `ci` nextest profile, which
+includes them).
 Slow tests are reported every ten seconds. For per-test durations, inspect
 `target/nextest/default/junit.xml` after a run. For one slow dwctl test:
 

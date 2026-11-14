@@ -317,7 +317,7 @@ down *args="":
     docker compose down {{args}}
 
 
-# Run tests: 'just test' or 'just test [docker|rust|ts|memory]'
+# Run tests: 'just test' or 'just test [docker|rust|quick|ts|memory]'
 #
 # Test targets available:
 #
@@ -336,6 +336,12 @@ down *args="":
 #
 # rust: Unit and integration tests for Rust services
 # - Requires PostgreSQL database (run 'just db-setup' first)
+# - --no-doctests skips the doctest pass
+#
+# quick: Only the Rust tests for the files changed since origin/main
+# - The default inner loop; maps changed files to a nextest filterset
+# - Flags: --print (show the filterset only), --base <ref>; other
+#   arguments go to nextest. Doctests are skipped.
 #
 # ts: Frontend unit tests and type checking
 # - Runs TypeScript compiler checks and ESLint
@@ -344,13 +350,14 @@ down *args="":
 # memory: Heap budgets for requests in flight (dwctl/tests/memory_budget)
 # - Requires PostgreSQL database (run 'just db-setup' first)
 # - Prints the heap each request holds. This is the local way to run them:
-#   'just test rust' skips them (nextest default-filter); CI runs them with
-#   the 'ci' nextest profile.
+#   'just test rust' and 'just test quick' skip them (nextest default-filter);
+#   CI runs them with the 'ci' nextest profile.
 #
 # Examples:
 #   just test                    # Test against running services
 #   just test docker             # Full docker integration test
 #   just test rust               # Backend unit tests
+#   just test quick              # Tests for the files you changed
 #   just test ts                 # Frontend tests
 #   just test memory             # Request memory budgets
 [positional-arguments]
@@ -361,6 +368,9 @@ test target="" *args="":
     shift
     if [[ "$target" == rust ]]; then
         exec ./scripts/test-rust.sh "$@"
+    fi
+    if [[ "$target" == quick ]]; then
+        exec ./scripts/test-quick.sh "$@"
     fi
     exec just _test-other "$target" "$@"
 
@@ -614,7 +624,7 @@ _test-other target="" *args="":
             cargo test --package dwctl --test memory_budget {{args}} -- --nocapture
             ;;
         *)
-            echo "Usage: just test [docker|rust|ts|memory]"
+            echo "Usage: just test [docker|rust|quick|ts|memory]"
             exit 1
             ;;
     esac
@@ -689,6 +699,7 @@ lint target *args="":
             echo "Checking SQLx prepared queries..."
             ./scripts/with-build-lock.sh cargo sqlx prepare --check --workspace
             python3 -B scripts/tests/test_rust_runner.py
+            python3 -B scripts/tests/test_quick_runner.py
             echo "Checking local Rust workspace topology..."
             bash .github/scripts/test-local-rust-workspace.sh
             .github/scripts/test-fusillade-migration-checksums.py

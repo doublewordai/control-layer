@@ -7,6 +7,7 @@ original_args=("$@")
 watch=false
 coverage=false
 no_run=false
+doctests=true
 args=()
 doc_args=()
 default_workspace=true
@@ -19,6 +20,7 @@ while (($#)); do
     case "$1" in
         --watch) watch=true; shift ;;
         --coverage) coverage=true; shift ;;
+        --no-doctests) doctests=false; shift ;;
         --no-run) no_run=true; args+=("$1"); shift ;;
         -p|--package|--exclude|-F|--features|--target)
             if (($# < 2)); then echo "$1 requires a value" >&2; exit 2; fi
@@ -53,6 +55,7 @@ if $watch; then
     fi
     command=(./scripts/test-rust.sh)
     if $coverage; then command+=(--coverage); fi
+    if ! $doctests; then command+=(--no-doctests); fi
     command+=(${args[@]+"${args[@]}"})
     printf -v watch_command '%q ' "${command[@]}"
     exec cargo watch -s "$watch_command"
@@ -72,7 +75,8 @@ fi
 
 # Nextest doesn't execute doctests. Keep these even if an integration test fails.
 # Runner filters (e.g. -E, -j, --partition) do not apply to rustdoc.
-if ! $no_run; then
+# --no-doctests skips this pass for the inner loop.
+if ! $no_run && $doctests; then
     cargo test --doc ${defaults[@]+"${defaults[@]}"} ${doc_args[@]+"${doc_args[@]}"} || status=$?
 fi
 exit "$status"
