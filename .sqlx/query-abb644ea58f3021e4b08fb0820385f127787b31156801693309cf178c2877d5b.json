@@ -1,0 +1,14 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n            UPDATE requests\n            SET state = 'failed',\n                error = '{\"error\":\"test\"}',\n                response_size = 16,\n                failed_at = NOW()\n            WHERE id = $1\n            ",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "abb644ea58f3021e4b08fb0820385f127787b31156801693309cf178c2877d5b"
+}

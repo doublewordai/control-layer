@@ -1,0 +1,14 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n            UPDATE requests\n            SET state = 'failed',\n                error = 'test error',\n                failed_at = NOW(),\n                retry_attempt = 3,\n                daemon_id = '00000000-0000-0000-0000-000000000001',\n                claimed_at = NOW() - INTERVAL '1 hour',\n                started_at = NOW() - INTERVAL '30 minutes'\n            WHERE batch_id = $1\n            AND id IN (\n                SELECT id FROM requests WHERE batch_id = $1 ORDER BY created_at LIMIT 2\n            )\n            ",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "9c1fea315c1478fbbef4a2fe67832778016bbe8590c0b140bf1f80b635ad1855"
+}

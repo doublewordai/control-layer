@@ -1,0 +1,14 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n            UPDATE requests\n            SET\n                state = 'processing',\n                started_at = NOW() - INTERVAL '3 seconds'\n            WHERE id = $1\n            ",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "5f39d018d7e9b7c28ca302fcf9f450ed8892d3846f9470d020c1ece5b537cd76"
+}

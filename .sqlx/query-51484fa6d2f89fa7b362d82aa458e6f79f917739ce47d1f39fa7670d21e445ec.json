@@ -1,0 +1,14 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "UPDATE requests SET state = 'completed', completed_at = NOW(), response_status = 200,\n             response_body = '{\"ok\":true}'\n             WHERE batch_id = $1 AND id IN (SELECT id FROM requests WHERE batch_id = $1 ORDER BY id LIMIT 2)",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "51484fa6d2f89fa7b362d82aa458e6f79f917739ce47d1f39fa7670d21e445ec"
+}

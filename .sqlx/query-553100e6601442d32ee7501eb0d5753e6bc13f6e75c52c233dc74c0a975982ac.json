@@ -1,0 +1,14 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "UPDATE requests SET state = 'canceled', canceled_at = NOW() WHERE batch_id = $1 AND state <> 'failed'",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "553100e6601442d32ee7501eb0d5753e6bc13f6e75c52c233dc74c0a975982ac"
+}

@@ -1,0 +1,28 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n            SELECT custom_id, line_number AS \"line_number!\"\n            FROM request_templates_all\n            WHERE file_id = $1\n            ORDER BY line_number\n            ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "custom_id",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 1,
+        "name": "line_number!",
+        "type_info": "Int4"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid"
+      ]
+    },
+    "nullable": [
+      true,
+      true
+    ]
+  },
+  "hash": "c363f4a0bac1e392fc55d18c5fd8471c76a9bce25d948dfd16923e804a5fc467"
+}

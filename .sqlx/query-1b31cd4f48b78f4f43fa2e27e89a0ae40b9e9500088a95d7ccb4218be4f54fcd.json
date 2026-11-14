@@ -1,0 +1,14 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "INSERT INTO model_filters (model, state, created_at) VALUES ('m-purge', 'coming', $1)",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Timestamptz"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "1b31cd4f48b78f4f43fa2e27e89a0ae40b9e9500088a95d7ccb4218be4f54fcd"
+}

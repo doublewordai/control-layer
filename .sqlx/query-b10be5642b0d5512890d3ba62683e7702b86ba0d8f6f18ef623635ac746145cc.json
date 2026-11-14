@@ -1,0 +1,28 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT counts_frozen_at IS NOT NULL AS \"frozen!\", canceled_requests\n               FROM batches WHERE id = $1",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "frozen!",
+        "type_info": "Bool"
+      },
+      {
+        "ordinal": 1,
+        "name": "canceled_requests",
+        "type_info": "Int8"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid"
+      ]
+    },
+    "nullable": [
+      null,
+      false
+    ]
+  },
+  "hash": "b10be5642b0d5512890d3ba62683e7702b86ba0d8f6f18ef623635ac746145cc"
+}

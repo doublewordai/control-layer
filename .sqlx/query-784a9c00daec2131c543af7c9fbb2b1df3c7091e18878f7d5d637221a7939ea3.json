@@ -1,0 +1,14 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n            UPDATE batches\n            SET failed_at = NOW(),\n                finalizing_at = NOW(),\n                notification_sent_at = NOW()\n            WHERE id = $1\n            ",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "784a9c00daec2131c543af7c9fbb2b1df3c7091e18878f7d5d637221a7939ea3"
+}

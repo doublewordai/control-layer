@@ -1,0 +1,46 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT location, retry_version, counts_frozen_at,\n                      (SELECT COUNT(*) FROM requests WHERE batch_id = $1 AND state = 'pending') AS \"pending!\",\n                      (SELECT COUNT(*) FROM batch_requests_archive WHERE batch_id = $1) AS \"archived!\"\n               FROM batches WHERE id = $1",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "location",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 1,
+        "name": "retry_version",
+        "type_info": "Int8"
+      },
+      {
+        "ordinal": 2,
+        "name": "counts_frozen_at",
+        "type_info": "Timestamptz"
+      },
+      {
+        "ordinal": 3,
+        "name": "pending!",
+        "type_info": "Int8"
+      },
+      {
+        "ordinal": 4,
+        "name": "archived!",
+        "type_info": "Int8"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      true,
+      null,
+      null
+    ]
+  },
+  "hash": "e1673cbe470fae7deb6db8b164e8a492aea4692dc7d2c68a2eb69941cc367117"
+}

@@ -1,0 +1,14 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "UPDATE requests SET claimed_at = NOW() - INTERVAL '3 seconds' WHERE id = $1",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "f7137ca2727a4fb7b0653b29ef15020931b9ed08eacfb651831893ac5f042ab7"
+}
