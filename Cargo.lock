@@ -1929,14 +1929,6 @@ dependencies = [
  "argon2",
  "async-compression",
  "async-stream",
- "async-stripe",
- "async-stripe-billing",
- "async-stripe-checkout",
- "async-stripe-core",
- "async-stripe-misc",
- "async-stripe-shared",
- "async-stripe-types",
- "async-stripe-webhook",
  "async-trait",
  "aws-credential-types",
  "aws-sdk-s3",
@@ -1955,6 +1947,7 @@ dependencies = [
  "dashmap",
  "deadpool-redis",
  "dotenvy",
+ "dwctl-stripe",
  "dwctl-test-macros",
  "eventsource-stream",
  "figment",
@@ -1980,7 +1973,6 @@ dependencies = [
  "metrics-exporter-prometheus",
  "mime_guess",
  "minijinja",
- "miniserde",
  "moka",
  "multer",
  "notify",
@@ -2034,6 +2026,25 @@ dependencies = [
  "uuid",
  "wiremock",
  "zstd",
+]
+
+[[package]]
+name = "dwctl-stripe"
+version = "0.1.0"
+dependencies = [
+ "async-stripe",
+ "async-stripe-billing",
+ "async-stripe-checkout",
+ "async-stripe-core",
+ "async-stripe-misc",
+ "async-stripe-shared",
+ "async-stripe-types",
+ "async-stripe-webhook",
+ "async-trait",
+ "miniserde",
+ "serde_json",
+ "thiserror 2.0.21",
+ "tracing",
 ]
 
 [[package]]

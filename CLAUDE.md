@@ -258,6 +258,12 @@ Flags can be combined: `?flags=demo,use_billing`
 - `db/models/`: Database record structures matching table schemas
 - `sync/`: Real-time sync between database and onwards routing layer via LISTEN/NOTIFY
 - `request_logging/`: Request/response logging powered by outlet/outlet-postgres
+- `payment_providers/`: `PaymentProvider` trait and its implementations; persistence and crediting rules
+
+`dwctl/stripe/` is a separate workspace crate (`dwctl-stripe`) holding every
+Stripe API call and all `stripe_*` types behind an API of plain types. The
+generated Stripe types are costly to compile against, so dwctl must not depend
+on the `async-stripe*` crates directly; add new Stripe calls to `dwctl-stripe`.
 
 ### Key External Dependencies
 

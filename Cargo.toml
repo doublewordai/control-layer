@@ -6,6 +6,7 @@ members = [
   "fusillade-core",
   "onwards",
   "openai-reassembler",
+  "dwctl/stripe",
   "dwctl/test-macros",
 ]
 default-members = ["dwctl"]

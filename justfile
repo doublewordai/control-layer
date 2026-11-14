@@ -658,6 +658,7 @@ lint target *args="":
                 --package fusillade-core \
                 --package fusillade-arsenal \
                 --package openai-reassembler \
+                --package dwctl-stripe \
                 --package dwctl-test-macros
             echo "Running cargo clippy..."
             cargo clippy \
@@ -666,6 +667,7 @@ lint target *args="":
                 --package fusillade-core \
                 --package fusillade-arsenal \
                 --package openai-reassembler \
+                --package dwctl-stripe \
                 --package dwctl-test-macros \
                 --all-features \
                 --no-deps \
@@ -673,6 +675,7 @@ lint target *args="":
             echo "Running ZDR no-payload-logging guard..."
             ./scripts/check-no-payload-logging.sh \
                 dwctl/src \
+                dwctl/stripe/src \
                 fusillade/src \
                 fusillade-core/src \
                 fusillade-arsenal/src
@@ -732,6 +735,7 @@ fmt target *args="":
                 --package fusillade-core \
                 --package fusillade-arsenal \
                 --package openai-reassembler \
+                --package dwctl-stripe \
                 --package dwctl-test-macros \
                 {{args}}
             ;;

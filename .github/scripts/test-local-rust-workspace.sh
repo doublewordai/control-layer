@@ -26,6 +26,7 @@ expected_packages = {
     "fusillade",
     "fusillade-core",
     "fusillade-arsenal",
+    "dwctl-stripe",
     "dwctl-test-macros",
 }
 workspace_packages = {
@@ -59,6 +60,7 @@ if workspace_manifest["workspace"].get("default-members") != ["dwctl"]:
 
 local_dependencies = {
     "dwctl/Cargo.toml": {
+        "dwctl-stripe": "stripe",
         "fusillade": "../fusillade",
         "fusillade-arsenal": "../fusillade-arsenal",
         "onwards": "../onwards",
@@ -75,6 +77,16 @@ local_dependencies = {
 dwctl_dependencies = tomllib.loads((root / "dwctl/Cargo.toml").read_text())[
     "dependencies"
 ]
+# The generated Stripe types are costly to compile against, so only
+# dwctl-stripe may name them; dwctl reaches Stripe through that crate.
+direct_stripe_dependencies = sorted(
+    name for name in dwctl_dependencies if name.startswith("async-stripe")
+)
+if direct_stripe_dependencies:
+    raise SystemExit(
+        "dwctl must use Stripe through dwctl-stripe, not depend on "
+        f"{direct_stripe_dependencies} directly"
+    )
 redis_dependency = dwctl_dependencies.get("redis")
 if not isinstance(redis_dependency, dict):
     raise SystemExit(
@@ -302,7 +314,7 @@ fi
 
 node .github/scripts/test-onwards-floating-tags.cjs
 
-for linted_package in dwctl fusillade fusillade-core fusillade-arsenal openai-reassembler; do
+for linted_package in dwctl dwctl-stripe fusillade fusillade-core fusillade-arsenal openai-reassembler; do
   if ! grep -Fq -- "--package $linted_package" "$justfile"; then
     echo "Rust linting must retain $linted_package" >&2
     exit 1

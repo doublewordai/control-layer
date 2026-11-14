@@ -152,32 +152,9 @@ http-body = "1"
 http-body-util = "0.1"
 dashmap = { version = "6.1.0", features = ["serde"] }
 moka = { version = "0.12", features = ["future"] }
-# Stripe payment processing - Fixed at rc0 currently as this is the only semi-stable version supporting a modern stripe API
-async-stripe = { version = "1.0.0-rc.0", default-features = false, features = [
-  "rustls-tls-webpki-roots",
-  "rustls-aws-lc-rs",
-] }
-async-stripe-checkout = { version = "1.0.0-rc.0", features = [
-  "checkout_session",
-] }
-async-stripe-webhook = { version = "1.0.0-rc.0", features = [
-  "async-stripe-checkout",
-  "deserialize",
-] }
-async-stripe-types = { version = "1.0.0-rc.0" }
-# The shared object types (PaymentMethod, SetupIntent, ...) the other stripe
-# crates hand back; named directly for the instrument-fingerprint helper.
-async-stripe-shared = { version = "1.0.0-rc.0" }
-async-stripe-core = { version = "1.0.0-rc.0", features = [
-  "payment_intent",
-  "customer",
-] }
-async-stripe-misc = { version = "1.0.0-rc.0", features = ["tax_calculation"] }
+# Stripe API client; the async-stripe crates are its dependencies, not ours.
+dwctl-stripe = { path = "stripe" }
 rustls = { version = "0.23", features = ["aws-lc-rs"] }
-async-stripe-billing = { version = "1.0.0-rc.0", features = [
-  "billing_portal_session",
-  "invoice_item",
-] }
 sqlx-pool-router = "1.0"
 minijinja = "2.15.1"
 multer = "3.1.0"
@@ -202,9 +179,6 @@ google-cloud-auth = "1.10"
 dwctl-test-macros = { path = "test-macros" }
 dotenvy = "0.15"
 axum-test = { version = "18.4.1" }
-# Builds Stripe objects from JSON in tests; the async-stripe types deserialize
-# through miniserde unconditionally, serde only behind a feature.
-miniserde = "0.1"
 sqlx = { version = "0.8", features = [
   "postgres",
   "runtime-tokio-rustls",
