@@ -246,10 +246,13 @@ jobs:
           export LLVM_PROFILE_FILE="$PWD/target/dwctl-${{ matrix.partition }}-%32m.profraw"
 
           BUILD_START=$(date +%s)
-          cargo nextest run --package dwctl --cargo-profile ci --no-run
+          cargo nextest run --package dwctl --profile ci --cargo-profile ci --no-run
           BUILD_END=$(date +%s)
           echo "dwctl compile/link: $((BUILD_END - BUILD_START))s"
+          # The ci nextest profile includes the memory-budget tests, which the
+          # default profile leaves out of local runs.
           cargo nextest run --package dwctl \
+            --profile ci \
             --cargo-profile ci \
             --partition "count:${{ matrix.partition }}/4"
           TEST_END=$(date +%s)
@@ -269,7 +272,7 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: rust-test-timings-dwctl-${{ matrix.partition }}
-          path: target/nextest/default/junit.xml
+          path: target/nextest/ci/junit.xml
           if-no-files-found: ignore
           retention-days: 7
 

@@ -1,6 +1,10 @@
 [profile.default]
 # Report slow tests without killing legitimate long-running integration tests.
 slow-timeout = { period = "10s" }
+# The memory-budget tests each take the whole machine (see the override below),
+# so local runs leave them to `just test memory`. A filterset given with -E is
+# intersected with this filter; add --ignore-default-filter to select them.
+default-filter = 'not binary(memory_budget)'
 
 [profile.default.junit]
 path = "junit.xml"
@@ -8,6 +12,18 @@ path = "junit.xml"
 [[profile.default.overrides]]
 # These load generators measure heap budgets under backpressure. Give each
 # measurement the machine, matching the serial execution in its native harness.
+filter = 'binary(memory_budget)'
+threads-required = "num-cpus"
+
+# CI runs everything, memory budgets included: `--profile ci`. Its report is
+# target/nextest/ci/junit.xml.
+[profile.ci]
+default-filter = 'all()'
+
+[profile.ci.junit]
+path = "junit.xml"
+
+[[profile.ci.overrides]]
 filter = 'binary(memory_budget)'
 threads-required = "num-cpus"
 
