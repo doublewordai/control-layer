@@ -133,7 +133,9 @@ includes application startup; setup includes cloning and fixtures. The first
 run after a template-key change also includes template construction.
 
 CI logs dwctl compile/link and execution durations separately and uploads
-per-shard JUnit reports. Pass multiple reports to `rust-test-timings.py` to
+per-shard JUnit reports (`target/nextest/ci/junit.xml`; CI uses the `ci`
+nextest profile, which also runs the memory-budget tests that local runs leave
+to `just test memory`). Pass multiple reports to `rust-test-timings.py` to
 summarize shards. The initial [PR CI run](https://github.com/doublewordai/control-layer/actions/runs/36926465776)
 passed, including all four locally failing tests. Compared with the
 [preceding merged PR](https://github.com/doublewordai/control-layer/actions/runs/36882204078),

@@ -77,6 +77,8 @@ require_text 'source <(cargo llvm-cov show-env --export-prefix)' 'instrument nex
 require_text 'LLVM_PROFILE_FILE="$PWD/target/dwctl-${{ matrix.partition }}-%32m.profraw"' 'bound per-process coverage profiles with an LLVM merge pool'
 require_text 'cargo nextest run --package dwctl' 'run each dwctl partition directly through nextest'
 require_text '--cargo-profile ci' 'compile dwctl partitions with the lean Cargo profile'
+require_text '            --profile ci \' 'run the memory-budget tests that the default nextest profile skips'
+require_text 'path: target/nextest/ci/junit.xml' 'upload the JUnit report of the ci nextest profile'
 require_text '--partition "count:${{ matrix.partition }}/4"' 'select one exhaustive dwctl count partition per runner'
 require_text 'cargo llvm-cov report --profile ci' 'export each pooled partition as LCOV'
 require_text 'name: rust-coverage-dwctl-${{ matrix.partition }}' 'upload each dwctl coverage partition independently'

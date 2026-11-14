@@ -343,7 +343,9 @@ down *args="":
 #
 # memory: Heap budgets for requests in flight (dwctl/tests/memory_budget)
 # - Requires PostgreSQL database (run 'just db-setup' first)
-# - Prints the heap each request holds; also part of 'just test rust'
+# - Prints the heap each request holds. This is the local way to run them:
+#   'just test rust' skips them (nextest default-filter); CI runs them with
+#   the 'ci' nextest profile.
 #
 # Examples:
 #   just test                    # Test against running services

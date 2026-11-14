@@ -136,6 +136,7 @@ just test rust -E 'test(/api::handlers::api_keys/)'
 just test rust              # Full suite: slow; see "Local verification"
 just test rust --watch      # Watch mode
 just test rust --coverage   # With coverage
+just test memory            # Memory-budget tests; 'just test rust' skips them, CI runs them
 
 # Frontend tests
 just test ts
