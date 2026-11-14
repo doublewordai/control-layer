@@ -61,3 +61,6 @@ docker-compose.local.yml
 .superpowers
 # Compiled Python bytecode from utility scripts
 __pycache__/
+
+# Local cargo settings (e.g. a build jobs cap); never committed
+/.cargo/

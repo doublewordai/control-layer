@@ -89,6 +89,8 @@ runs the probe service, and (configurably) the batch daemon
 brew install just hurl postgresql pnpm
 brew install --cask docker   # any Docker runtime works (Docker Desktop, OrbStack, colima)
 # cargo comes from rustup, not Homebrew: https://rustup.rs
+# Optional: flock, for the build lock described under Testing
+brew install flock
 
 # Check all dependencies installed
 just check
@@ -126,8 +128,12 @@ cargo run
 ### Testing
 
 ```bash
-# Backend tests via nextest, followed by doctests (requires database)
-just test rust
+# Backend tests via nextest, followed by doctests (requires database).
+# While iterating, check the crate and run only the modules you touched:
+cargo check -p dwctl
+just test rust -E 'test(/api::handlers::api_keys/)'
+
+just test rust              # Full suite: slow; see "Local verification"
 just test rust --watch      # Watch mode
 just test rust --coverage   # With coverage
 
@@ -457,10 +463,39 @@ Note: Even databases claiming "zero replication lag" (like Neon) can exhibit lag
 - Focus on "why" not "what" (the diff shows what changed)
 - Reference issue numbers when applicable
 - Don't coauthor commits
-- Before commiting, run `just lint rust`, `just test rust` (if you've changed
-any rust code), `just lint ts`, and `just test ts` (if you've changed any ts
-code) to ensure code quality. NEVER PUSH ANY CODE THAT DOESN'T PASS ALL LINTS
-AND TESTS.
+- Verify before pushing as described in "Local verification" below. NEVER
+PUSH ANY CODE THAT DOESN'T PASS LINT AND THE TESTS FOR WHAT YOU CHANGED.
+
+**Local verification:**
+
+Rust:
+
+- While iterating: `cargo check -p <crate>` and `just test rust -E '<filter>'`
+  for the modules you touched, e.g.
+  `just test rust -E 'test(/api::handlers::api_keys/)'`.
+- Before opening or updating a PR: `just lint rust`, once.
+- Run the full `just test rust` at most once per PR, and only when the change
+  touches shared infrastructure (migrations, test harness, config, auth
+  middleware). Otherwise CI's merge queue is the gate.
+- Never rerun the full suite because one test failed; rerun that test with `-E`.
+
+TypeScript: run `just lint ts` and `just test ts` before committing if you
+changed any TS code.
+
+**Sharing a machine (several agents or worktrees):**
+
+- Do not rerun the full suite to re-verify an unrelated fix.
+- Do not `touch` source files to force a recompile. If SQLx query metadata is
+  stale, run `cargo sqlx prepare`.
+- `just test rust` and the heavy steps of `just lint rust` take a machine-wide
+  build lock (`scripts/with-build-lock.sh`, needs `flock`) so one heavy job
+  runs at a time. A "waiting for build lock" line means another job holds it;
+  wait, do not bypass it.
+- To leave CPU headroom, cap cargo with `CARGO_BUILD_JOBS` or `[build] jobs`
+  in a local, untracked `.cargo/config.toml`. Never commit a `.cargo/`
+  directory.
+- Never run `just db-setup` or reset databases on a Postgres instance shared
+  between worktrees.
 
 **Performance:**
 
