@@ -1,0 +1,46 @@
+[package]
+name = "dwctl-stripe"
+version = "0.1.0"
+edition = "2024"
+publish = false
+description = "Stripe API client for dwctl: the async-stripe types stay behind a small API of plain types"
+license = "MIT OR Apache-2.0"
+
+[dependencies]
+# Stripe payment processing - Fixed at rc0 currently as this is the only semi-stable version supporting a modern stripe API
+async-stripe = { version = "1.0.0-rc.0", default-features = false, features = [
+  "rustls-tls-webpki-roots",
+  "rustls-aws-lc-rs",
+] }
+async-stripe-checkout = { version = "1.0.0-rc.0", features = [
+  "checkout_session",
+] }
+async-stripe-webhook = { version = "1.0.0-rc.0", features = [
+  "async-stripe-checkout",
+  "deserialize",
+] }
+async-stripe-types = { version = "1.0.0-rc.0" }
+# The shared object types (PaymentMethod, SetupIntent, ...) the other stripe
+# crates hand back; named directly for the instrument-fingerprint helper.
+async-stripe-shared = { version = "1.0.0-rc.0" }
+async-stripe-core = { version = "1.0.0-rc.0", features = [
+  "payment_intent",
+  "customer",
+] }
+async-stripe-misc = { version = "1.0.0-rc.0", features = ["tax_calculation"] }
+async-stripe-billing = { version = "1.0.0-rc.0", features = [
+  "billing_portal_session",
+  "invoice_item",
+] }
+async-trait = "0.1"
+thiserror = "2.0.14"
+tracing = "0.1"
+
+[dev-dependencies]
+# Builds Stripe objects from JSON in tests; the async-stripe types deserialize
+# through miniserde unconditionally, serde only behind a feature.
+miniserde = "0.1"
+serde_json = "1.0"
+
+[lints]
+workspace = true

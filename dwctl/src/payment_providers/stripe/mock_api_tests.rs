@@ -3,7 +3,7 @@
 //! The provider's client is pointed at a `wiremock` server through
 //! `StripeConfig::api_base_url`, so the real async-stripe request building,
 //! response parsing and error mapping all run, and nothing reaches Stripe. The
-//! fixtures under `test_fixtures/` follow the shape of real API objects but use
+//! fixtures under `dwctl/stripe/test_fixtures/` follow the shape of real API objects but use
 //! fictional ids, emails and amounts. Webhook payloads are signed in-test with
 //! Stripe's scheme so `Webhook::construct_event` runs for real.
 
@@ -29,17 +29,17 @@ const CUSTOMER_ID: &str = "cus_ExampleCustomer";
 
 fn fixture(name: &str) -> Value {
     let raw = match name {
-        "checkout_session_with_tax" => include_str!("../test_fixtures/checkout_session_with_tax.json"),
-        "setup_session_card" => include_str!("../test_fixtures/setup_session_card.json"),
-        "customer" => include_str!("../test_fixtures/customer.json"),
-        "payment_method_list" => include_str!("../test_fixtures/payment_method_list.json"),
-        "tax_calculation" => include_str!("../test_fixtures/tax_calculation.json"),
-        "payment_intent_succeeded" => include_str!("../test_fixtures/payment_intent_succeeded.json"),
-        "invoice_item" => include_str!("../test_fixtures/invoice_item.json"),
-        "billing_portal_session" => include_str!("../test_fixtures/billing_portal_session.json"),
-        "error_card_declined" => include_str!("../test_fixtures/error_card_declined.json"),
-        "error_card_declined_soft" => include_str!("../test_fixtures/error_card_declined_soft.json"),
-        "error_idempotency_in_use" => include_str!("../test_fixtures/error_idempotency_in_use.json"),
+        "checkout_session_with_tax" => include_str!("../../../stripe/test_fixtures/checkout_session_with_tax.json"),
+        "setup_session_card" => include_str!("../../../stripe/test_fixtures/setup_session_card.json"),
+        "customer" => include_str!("../../../stripe/test_fixtures/customer.json"),
+        "payment_method_list" => include_str!("../../../stripe/test_fixtures/payment_method_list.json"),
+        "tax_calculation" => include_str!("../../../stripe/test_fixtures/tax_calculation.json"),
+        "payment_intent_succeeded" => include_str!("../../../stripe/test_fixtures/payment_intent_succeeded.json"),
+        "invoice_item" => include_str!("../../../stripe/test_fixtures/invoice_item.json"),
+        "billing_portal_session" => include_str!("../../../stripe/test_fixtures/billing_portal_session.json"),
+        "error_card_declined" => include_str!("../../../stripe/test_fixtures/error_card_declined.json"),
+        "error_card_declined_soft" => include_str!("../../../stripe/test_fixtures/error_card_declined_soft.json"),
+        "error_idempotency_in_use" => include_str!("../../../stripe/test_fixtures/error_idempotency_in_use.json"),
         other => panic!("unknown fixture {other}"),
     };
     serde_json::from_str(raw).expect("fixture is valid JSON")
